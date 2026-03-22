@@ -219,20 +219,38 @@ app.post("/queue/join", async (req, res) => {
       });
     }
 
-    await pool.query(
+    const existing = await pool.query(
       `
-      INSERT INTO queue_entries (client_id, nickname, mode, status, match_id, joined_at, updated_at)
-      VALUES ($1, $2, $3, 'searching', NULL, CURRENT_DATE, CURRENT_DATE)
-      ON CONFLICT (client_id)
-      DO UPDATE SET
-        nickname = EXCLUDED.nickname,
-        mode = EXCLUDED.mode,
-        status = 'searching',
-        match_id = NULL,
-        updated_at = CURRENT_DATE
+      SELECT client_id
+      FROM queue_entries
+      WHERE client_id = $1
+      LIMIT 1
       `,
-      [clientId, nickname, mode]
+      [clientId]
     );
+
+    if (existing.rows.length > 0) {
+      await pool.query(
+        `
+        UPDATE queue_entries
+        SET nickname = $2,
+            mode = $3,
+            status = 'searching',
+            match_id = NULL,
+            updated_at = CURRENT_DATE
+        WHERE client_id = $1
+        `,
+        [clientId, nickname, mode]
+      );
+    } else {
+      await pool.query(
+        `
+        INSERT INTO queue_entries (client_id, nickname, mode, status, match_id, joined_at, updated_at)
+        VALUES ($1, $2, $3, 'searching', NULL, CURRENT_DATE, CURRENT_DATE)
+        `,
+        [clientId, nickname, mode]
+      );
+    }
 
     const matchId = await tryCreateMatch(mode);
 
