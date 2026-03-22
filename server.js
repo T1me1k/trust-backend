@@ -2,12 +2,50 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 const crypto = require("crypto");
+const session = require("express-session");
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+const SITE_ORIGIN = process.env.SITE_ORIGIN || process.env.PUBLIC_SITE_URL || "";
+const PUBLIC_SITE_URL = process.env.PUBLIC_SITE_URL || SITE_ORIGIN || "";
+const BACKEND_BASE_URL = process.env.BACKEND_BASE_URL || "";
+const SESSION_SECRET = process.env.SESSION_SECRET || "change_me_session_secret";
+const STEAM_API_KEY = process.env.STEAM_API_KEY || "";
+const COOKIE_SECURE = String(process.env.COOKIE_SECURE || "true").toLowerCase() === "true";
+
+app.set("trust proxy", 1);
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+
+      const allowed = [SITE_ORIGIN, PUBLIC_SITE_URL].filter(Boolean);
+      if (allowed.includes(origin)) return callback(null, true);
+
+      return callback(null, false);
+    },
+    credentials: true
+  })
+);
+
+app.use(
+  session({
+    name: "trust.sid",
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: COOKIE_SECURE,
+      sameSite: "lax",
+      maxAge: 1000 * 60 * 60 * 24 * 30
+    }
+  })
+);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -37,6 +75,166 @@ function newMatchId() {
 
 function nowMs() {
   return Date.now();
+}
+
+function newLinkCode(length = 8) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = crypto.randomBytes(length);
+  let out = "";
+
+  for (let i = 0; i < length; i++) {
+    out += alphabet[bytes[i] % alphabet.length];
+  }
+
+  return out;
+}
+
+function sha256(input) {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+function createSteamLoginState(req) {
+  const raw = crypto.randomBytes(24).toString("hex");
+  req.session.steamLoginState = sha256(raw);
+  return raw;
+}
+
+function validateSteamLoginState(req, raw) {
+  if (!raw || !req.session.steamLoginState) return false;
+  return sha256(raw) === req.session.steamLoginState;
+}
+
+function buildSteamLoginUrl(returnTo) {
+  const steamOpenIdEndpoint = "https://steamcommunity.com/openid/login";
+  const steamOpenIdNs = "http://specs.openid.net/auth/2.0";
+
+  const params = new URLSearchParams({
+    "openid.ns": steamOpenIdNs,
+    "openid.mode": "checkid_setup",
+    "openid.return_to": returnTo,
+    "openid.realm": PUBLIC_SITE_URL,
+    "openid.identity": `${steamOpenIdNs}/identifier_select`,
+    "openid.claimed_id": `${steamOpenIdNs}/identifier_select`
+  });
+
+  return `${steamOpenIdEndpoint}?${params.toString()}`;
+}
+
+async function verifySteamOpenId(queryParams) {
+  const steamOpenIdEndpoint = "https://steamcommunity.com/openid/login";
+  const claimedIdRegex = /^https?:\/\/steamcommunity\.com\/openid\/id\/(\d{17,25})$/i;
+
+  const params = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(queryParams)) {
+    if (typeof value === "string") {
+      params.set(key, value);
+    }
+  }
+
+  params.set("openid.mode", "check_authentication");
+
+  const response = await fetch(steamOpenIdEndpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: params.toString()
+  });
+
+  const text = await response.text();
+
+  if (!text.includes("is_valid:true")) {
+    throw new Error("Steam OpenID verification failed");
+  }
+
+  const claimedId =
+    queryParams["openid.claimed_id"] || queryParams["openid.identity"];
+
+  const match = claimedId && claimedId.match(claimedIdRegex);
+  if (!match) {
+    throw new Error("Invalid Steam claimed_id");
+  }
+
+  return match[1];
+}
+
+async function fetchSteamProfile(steamId) {
+  if (!STEAM_API_KEY) {
+    return {
+      steamid: steamId,
+      personaname: null,
+      profileurl: `https://steamcommunity.com/profiles/${steamId}`,
+      avatar: null,
+      avatarmedium: null,
+      avatarfull: null
+    };
+  }
+
+  const url = new URL("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/");
+  url.searchParams.set("key", STEAM_API_KEY);
+  url.searchParams.set("steamids", steamId);
+
+  const response = await fetch(url.toString());
+  if (!response.ok) {
+    throw new Error(`Steam profile fetch failed: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const player = data?.response?.players?.[0];
+
+  return {
+    steamid: steamId,
+    personaname: player?.personaname || null,
+    profileurl: player?.profileurl || `https://steamcommunity.com/profiles/${steamId}`,
+    avatar: player?.avatar || null,
+    avatarmedium: player?.avatarmedium || null,
+    avatarfull: player?.avatarfull || null
+  };
+}
+
+async function upsertUserFromSteam(profile) {
+  const result = await pool.query(
+    `
+    INSERT INTO users (
+      steam_id,
+      persona_name,
+      profile_url,
+      avatar_url,
+      avatar_medium_url,
+      avatar_full_url,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+    ON CONFLICT (steam_id)
+    DO UPDATE SET
+      persona_name = EXCLUDED.persona_name,
+      profile_url = EXCLUDED.profile_url,
+      avatar_url = EXCLUDED.avatar_url,
+      avatar_medium_url = EXCLUDED.avatar_medium_url,
+      avatar_full_url = EXCLUDED.avatar_full_url,
+      updated_at = NOW()
+    RETURNING *
+    `,
+    [
+      profile.steamid,
+      profile.personaname,
+      profile.profileurl,
+      profile.avatar,
+      profile.avatarmedium,
+      profile.avatarfull
+    ]
+  );
+
+  return result.rows[0];
+}
+
+function requireAuth(req, res, next) {
+  if (!req.session.userId) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  next();
 }
 
 async function ensureSchema() {
@@ -127,6 +325,63 @@ async function ensureSchema() {
     CREATE INDEX IF NOT EXISTS idx_match_players_match_id
     ON match_players(match_id)
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      steam_id VARCHAR(32) NOT NULL UNIQUE,
+      persona_name TEXT,
+      profile_url TEXT,
+      avatar_url TEXT,
+      avatar_medium_url TEXT,
+      avatar_full_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS launcher_links (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      client_id TEXT NOT NULL UNIQUE,
+      nickname TEXT,
+      linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_links_user_id
+    ON launcher_links(user_id)
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS launcher_link_codes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      code VARCHAR(16) NOT NULL UNIQUE,
+      client_id TEXT NOT NULL,
+      nickname TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      consumed_at TIMESTAMPTZ,
+      consumed_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_link_codes_code
+    ON launcher_link_codes(code)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_link_codes_client_id
+    ON launcher_link_codes(client_id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_link_codes_expires_at
+    ON launcher_link_codes(expires_at)
+  `);
 }
 
 async function pingPresence(clientId, nickname) {
@@ -198,6 +453,15 @@ async function cleanupStalePresence() {
     WHERE last_seen_ms < $1
     `,
     [cutoff]
+  );
+}
+
+async function cleanupExpiredLinkCodes() {
+  await pool.query(
+    `
+    DELETE FROM launcher_link_codes
+    WHERE expires_at < NOW() - INTERVAL '1 day'
+    `
   );
 }
 
@@ -360,6 +624,97 @@ app.get("/config", (req, res) => {
   res.json({
     ok: true,
     config: launcherConfig
+  });
+});
+
+app.get("/auth/me", async (req, res) => {
+  try {
+    if (!req.session.userId) {
+      return res.json({
+        ok: true,
+        authenticated: false,
+        user: null
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        steam_id,
+        persona_name,
+        profile_url,
+        avatar_full_url,
+        created_at,
+        updated_at
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [req.session.userId]
+    );
+
+    const user = result.rows[0] || null;
+
+    return res.json({
+      ok: true,
+      authenticated: !!user,
+      user
+    });
+  } catch (err) {
+    console.error("auth me error:", err);
+    res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      details: err.message
+    });
+  }
+});
+
+app.get("/auth/steam", async (req, res) => {
+  try {
+    if (!BACKEND_BASE_URL || !PUBLIC_SITE_URL) {
+      return res.status(500).send("Missing BACKEND_BASE_URL or PUBLIC_SITE_URL");
+    }
+
+    const state = createSteamLoginState(req);
+    const returnTo =
+      `${BACKEND_BASE_URL}/auth/steam/callback?state=${encodeURIComponent(state)}`;
+
+    const loginUrl = buildSteamLoginUrl(returnTo);
+    return res.redirect(loginUrl);
+  } catch (err) {
+    console.error("auth steam error:", err);
+    return res.status(500).send("Steam login init failed");
+  }
+});
+
+app.get("/auth/steam/callback", async (req, res) => {
+  try {
+    const state = req.query.state;
+
+    if (!validateSteamLoginState(req, state)) {
+      return res.status(400).send("Invalid login state");
+    }
+
+    const steamId = await verifySteamOpenId(req.query);
+    const profile = await fetchSteamProfile(steamId);
+    const user = await upsertUserFromSteam(profile);
+
+    req.session.userId = user.id;
+    delete req.session.steamLoginState;
+
+    return res.redirect(`${PUBLIC_SITE_URL}/?login=success`);
+  } catch (err) {
+    console.error("steam callback error:", err);
+    return res.redirect(`${PUBLIC_SITE_URL}/?login=error`);
+  }
+});
+
+app.post("/auth/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.clearCookie("trust.sid");
+    res.json({ ok: true });
   });
 });
 
@@ -737,6 +1092,208 @@ app.get("/match/:matchId", async (req, res) => {
   }
 });
 
+app.post("/launcher/link-code", async (req, res) => {
+  try {
+    const { clientId, nickname } = req.body || {};
+
+    if (!clientId || typeof clientId !== "string") {
+      return res.status(400).json({ ok: false, error: "clientId is required" });
+    }
+
+    const code = newLinkCode(8);
+
+    const result = await pool.query(
+      `
+      INSERT INTO launcher_link_codes (
+        code,
+        client_id,
+        nickname,
+        expires_at
+      )
+      VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes')
+      RETURNING code, client_id, nickname, expires_at
+      `,
+      [code, clientId, typeof nickname === "string" ? nickname.trim() : null]
+    );
+
+    return res.json({
+      ok: true,
+      code: result.rows[0].code,
+      expiresAt: result.rows[0].expires_at
+    });
+  } catch (err) {
+    console.error("create link code error:", err);
+    res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      details: err.message
+    });
+  }
+});
+
+app.post("/launcher/link/confirm", requireAuth, async (req, res) => {
+  try {
+    const code = String(req.body?.code || "").trim().toUpperCase();
+
+    if (!code) {
+      return res.status(400).json({ ok: false, error: "code is required" });
+    }
+
+    const codeResult = await pool.query(
+      `
+      SELECT *
+      FROM launcher_link_codes
+      WHERE code = $1
+      LIMIT 1
+      `,
+      [code]
+    );
+
+    const row = codeResult.rows[0];
+
+    if (!row) {
+      return res.status(400).json({ ok: false, error: "invalid_link_code" });
+    }
+
+    if (row.consumed_at) {
+      return res.status(400).json({ ok: false, error: "link_code_already_used" });
+    }
+
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ ok: false, error: "link_code_expired" });
+    }
+
+    const existingClientLink = await pool.query(
+      `
+      SELECT *
+      FROM launcher_links
+      WHERE client_id = $1
+      LIMIT 1
+      `,
+      [row.client_id]
+    );
+
+    if (existingClientLink.rows.length > 0) {
+      await pool.query(
+        `
+        UPDATE launcher_link_codes
+        SET consumed_at = NOW(),
+            consumed_by_user_id = $2
+        WHERE id = $1
+        `,
+        [row.id, req.session.userId]
+      );
+
+      return res.json({
+        ok: true,
+        linked: true,
+        alreadyLinked: true,
+        clientId: row.client_id,
+        nickname: row.nickname
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      await client.query(
+        `
+        INSERT INTO launcher_links (
+          user_id,
+          client_id,
+          nickname
+        )
+        VALUES ($1, $2, $3)
+        ON CONFLICT (client_id)
+        DO NOTHING
+        `,
+        [req.session.userId, row.client_id, row.nickname]
+      );
+
+      await client.query(
+        `
+        UPDATE launcher_link_codes
+        SET consumed_at = NOW(),
+            consumed_by_user_id = $2
+        WHERE id = $1
+        `,
+        [row.id, req.session.userId]
+      );
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    return res.json({
+      ok: true,
+      linked: true,
+      alreadyLinked: false,
+      clientId: row.client_id,
+      nickname: row.nickname
+    });
+  } catch (err) {
+    console.error("confirm link code error:", err);
+    res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      details: err.message
+    });
+  }
+});
+
+app.get("/launcher/account/by-client/:clientId", async (req, res) => {
+  try {
+    const { clientId } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT
+        ll.client_id,
+        ll.nickname,
+        ll.linked_at,
+        u.id AS user_id,
+        u.steam_id,
+        u.persona_name,
+        u.profile_url,
+        u.avatar_full_url
+      FROM launcher_links ll
+      JOIN users u ON u.id = ll.user_id
+      WHERE ll.client_id = $1
+      LIMIT 1
+      `,
+      [clientId]
+    );
+
+    const linked = result.rows[0] || null;
+
+    if (!linked) {
+      return res.json({
+        ok: true,
+        linked: false,
+        account: null
+      });
+    }
+
+    return res.json({
+      ok: true,
+      linked: true,
+      account: linked
+    });
+  } catch (err) {
+    console.error("get linked account error:", err);
+    res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      details: err.message
+    });
+  }
+});
+
 async function start() {
   try {
     await ensureSchema();
@@ -744,6 +1301,7 @@ async function start() {
     setInterval(() => {
       cleanupStaleQueueEntries().catch(err => console.error("cleanup queue error:", err));
       cleanupStalePresence().catch(err => console.error("cleanup presence error:", err));
+      cleanupExpiredLinkCodes().catch(err => console.error("cleanup link codes error:", err));
     }, 10000);
 
     app.listen(PORT, () => {
