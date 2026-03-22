@@ -1,7 +1,25 @@
 {
   "name": "trust-backend",
   "version": "1.0.0",
-  "type": "module",
+  {
+  "name": "trust-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "express-session": "^1.19.0",
+    "helmet": "^8.1.0",
+    "node-fetch": "^3.3.2",
+    "pg": "^8.13.3",
+    "uuid": "^11.1.0"
+  }
+}
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
