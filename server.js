@@ -132,11 +132,13 @@ function buildSteamLoginUrl(returnTo) {
   const steamOpenIdEndpoint = "https://steamcommunity.com/openid/login";
   const steamOpenIdNs = "http://specs.openid.net/auth/2.0";
 
+  const backendRealm = toOrigin(BACKEND_BASE_URL);
+
   const params = new URLSearchParams({
     "openid.ns": steamOpenIdNs,
     "openid.mode": "checkid_setup",
     "openid.return_to": returnTo,
-    "openid.realm": toOrigin(PUBLIC_SITE_URL),
+    "openid.realm": backendRealm,
     "openid.identity": `${steamOpenIdNs}/identifier_select`,
     "openid.claimed_id": `${steamOpenIdNs}/identifier_select`
   });
