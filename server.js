@@ -12,7 +12,7 @@ const launcherConfig = {
   appName: "TRUST",
   minSupportedVersion: "0.1.0",
   latestVersion: "0.1.0",
-  matchmakingEnabled: false,
+  matchmakingEnabled: true,
   maintenance: false,
   motd: "Welcome to TRUST alpha",
   news: [
