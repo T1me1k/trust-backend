@@ -56,7 +56,8 @@ async function ensureSchema() {
       status TEXT NOT NULL,
       match_id TEXT,
       joined_at DATE NOT NULL DEFAULT CURRENT_DATE,
-      updated_at DATE NOT NULL DEFAULT CURRENT_DATE
+      updated_at DATE NOT NULL DEFAULT CURRENT_DATE,
+      last_seen_ms BIGINT NOT NULL DEFAULT 0
     )
   `);
 
@@ -175,9 +176,36 @@ async function getOnlineCount() {
   return q.rows[0]?.online_count || 0;
 }
 
+async function cleanupStaleQueueEntries() {
+  const cutoff = nowMs() - 45000;
+
+  await pool.query(
+    `
+    DELETE FROM queue_entries
+    WHERE last_seen_ms < $1
+      AND status = 'searching'
+    `,
+    [cutoff]
+  );
+}
+
+async function cleanupStalePresence() {
+  const cutoff = nowMs() - 60000;
+
+  await pool.query(
+    `
+    DELETE FROM presence
+    WHERE last_seen_ms < $1
+    `,
+    [cutoff]
+  );
+}
+
 async function tryCreateMatch(mode) {
   const need = requiredPlayers(mode);
   if (!need) return null;
+
+  await cleanupStaleQueueEntries();
 
   const cutoff = nowMs() - 45000;
 
@@ -712,6 +740,12 @@ app.get("/match/:matchId", async (req, res) => {
 async function start() {
   try {
     await ensureSchema();
+
+    setInterval(() => {
+      cleanupStaleQueueEntries().catch(err => console.error("cleanup queue error:", err));
+      cleanupStalePresence().catch(err => console.error("cleanup presence error:", err));
+    }, 10000);
+
     app.listen(PORT, () => {
       console.log(`TRUST backend running on port ${PORT}`);
     });
