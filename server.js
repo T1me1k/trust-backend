@@ -16,16 +16,40 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "change_me_session_secret";
 const STEAM_API_KEY = process.env.STEAM_API_KEY || "";
 const COOKIE_SECURE = String(process.env.COOKIE_SECURE || "true").toLowerCase() === "true";
 
+function toOrigin(value) {
+  if (!value) return "";
+  try {
+    return new URL(value).origin;
+  } catch (_) {
+    return value.replace(/\/+$/, "");
+  }
+}
+
+const ALLOWED_ORIGINS = Array.from(
+  new Set(
+    [SITE_ORIGIN, PUBLIC_SITE_URL]
+      .filter(Boolean)
+      .map(toOrigin)
+      .filter(Boolean)
+  )
+);
+
 app.set("trust proxy", 1);
 
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
+      if (!origin || origin === "null") {
+        return callback(null, true);
+      }
 
-      const allowed = [SITE_ORIGIN, PUBLIC_SITE_URL].filter(Boolean);
-      if (allowed.includes(origin)) return callback(null, true);
+      const normalizedOrigin = toOrigin(origin);
 
+      if (ALLOWED_ORIGINS.includes(normalizedOrigin)) {
+        return callback(null, true);
+      }
+
+      console.log("CORS blocked origin:", origin, "allowed:", ALLOWED_ORIGINS);
       return callback(null, false);
     },
     credentials: true
@@ -112,7 +136,7 @@ function buildSteamLoginUrl(returnTo) {
     "openid.ns": steamOpenIdNs,
     "openid.mode": "checkid_setup",
     "openid.return_to": returnTo,
-    "openid.realm": PUBLIC_SITE_URL,
+    "openid.realm": toOrigin(PUBLIC_SITE_URL),
     "openid.identity": `${steamOpenIdNs}/identifier_select`,
     "openid.claimed_id": `${steamOpenIdNs}/identifier_select`
   });
@@ -238,6 +262,10 @@ function requireAuth(req, res, next) {
 }
 
 async function ensureSchema() {
+  await pool.query(`
+    CREATE EXTENSION IF NOT EXISTS pgcrypto
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS presence (
       client_id TEXT PRIMARY KEY,
@@ -577,7 +605,8 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "trust-backend",
-    message: "TRUST backend is running"
+    message: "TRUST backend is running",
+    allowedOrigins: ALLOWED_ORIGINS
   });
 });
 
@@ -1297,6 +1326,8 @@ app.get("/launcher/account/by-client/:clientId", async (req, res) => {
 async function start() {
   try {
     await ensureSchema();
+
+    console.log("Allowed CORS origins:", ALLOWED_ORIGINS);
 
     setInterval(() => {
       cleanupStaleQueueEntries().catch(err => console.error("cleanup queue error:", err));
