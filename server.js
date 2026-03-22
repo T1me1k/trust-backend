@@ -711,7 +711,15 @@ app.get("/auth/steam", async (req, res) => {
       `${BACKEND_BASE_URL}/auth/steam/callback?state=${encodeURIComponent(state)}`;
 
     const loginUrl = buildSteamLoginUrl(returnTo);
-    return res.redirect(loginUrl);
+
+    req.session.save((err) => {
+      if (err) {
+        console.error("session save before steam redirect error:", err);
+        return res.status(500).send("Failed to initialize Steam login session");
+      }
+
+      return res.redirect(loginUrl);
+    });
   } catch (err) {
     console.error("auth steam error:", err);
     return res.status(500).send("Steam login init failed");
@@ -723,7 +731,12 @@ app.get("/auth/steam/callback", async (req, res) => {
     const state = req.query.state;
 
     if (!validateSteamLoginState(req, state)) {
-      return res.status(400).send("Invalid login state");
+      console.error("steam callback invalid state", {
+        gotState: state,
+        hasSession: !!req.session,
+        storedState: req.session?.steamLoginState || null
+      });
+      return res.redirect(`${PUBLIC_SITE_URL}/?login=error`);
     }
 
     const steamId = await verifySteamOpenId(req.query);
@@ -733,7 +746,14 @@ app.get("/auth/steam/callback", async (req, res) => {
     req.session.userId = user.id;
     delete req.session.steamLoginState;
 
-    return res.redirect(`${PUBLIC_SITE_URL}/?login=success`);
+    req.session.save((err) => {
+      if (err) {
+        console.error("session save after steam callback error:", err);
+        return res.redirect(`${PUBLIC_SITE_URL}/?login=error`);
+      }
+
+      return res.redirect(`${PUBLIC_SITE_URL}/?login=success`);
+    });
   } catch (err) {
     console.error("steam callback error:", err);
     return res.redirect(`${PUBLIC_SITE_URL}/?login=error`);
