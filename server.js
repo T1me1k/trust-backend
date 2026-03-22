@@ -62,13 +62,20 @@ app.use(
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    app.use(
+  session({
+    name: "trust.sid",
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: COOKIE_SECURE,
+      secure: true,
       sameSite: "none",
-secure: true
       maxAge: 1000 * 60 * 60 * 24 * 30
     }
+  })
+);
   })
 );
 
