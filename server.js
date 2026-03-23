@@ -64,8 +64,8 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: true,
-      sameSite: "none",
+      secure: COOKIE_SECURE,
+      sameSite: COOKIE_SECURE ? "none" : "lax",
       maxAge: 1000 * 60 * 60 * 24 * 30
     }
   })
@@ -116,7 +116,6 @@ function newLinkCode(length = 8) {
 function newLauncherLinkToken() {
   return crypto.randomBytes(24).toString("hex");
 }
-
 
 function sha256(input) {
   return crypto.createHash("sha256").update(input).digest("hex");
@@ -224,6 +223,852 @@ async function fetchSteamProfile(steamId) {
   };
 }
 
+async function upsertUserFromSteam(profile) {
+  const result = await pool.query(
+    `
+    INSERT INTO users (
+      steam_id,
+      persona_name,
+      profile_url,
+      avatar_url,
+      avatar_medium_url,
+      avatar_full_url,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+    ON CONFLICT (steam_id)
+    DO UPDATE SET
+      persona_name = EXCLUDED.persona_name,
+      profile_url = EXCLUDED.profile_url,
+      avatar_url = EXCLUDED.avatar_url,
+      avatar_medium_url = EXCLUDED.avatar_medium_url,
+      avatar_full_url = EXCLUDED.avatar_full_url,
+      updated_at = NOW()
+    RETURNING *
+    `,
+    [
+      profile.steamid,
+      profile.personaname,
+      profile.profileurl,
+      profile.avatar,
+      profile.avatarmedium,
+      profile.avatarfull
+    ]
+  );
+
+  return result.rows[0];
+}
+
+function requireAuth(req, res, next) {
+  if (!req.session.userId) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  next();
+}
+
+async function ensureSchema() {
+  await pool.query(`
+    CREATE EXTENSION IF NOT EXISTS pgcrypto
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS presence (
+      client_id TEXT PRIMARY KEY,
+      nickname TEXT NOT NULL,
+      last_seen_ms BIGINT NOT NULL DEFAULT 0
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS queue_entries (
+      client_id TEXT PRIMARY KEY,
+      nickname TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      match_id TEXT,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_ms BIGINT NOT NULL DEFAULT 0
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS matches (
+      id TEXT PRIMARY KEY,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS match_players (
+      id SERIAL PRIMARY KEY,
+      match_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      nickname TEXT NOT NULL,
+      accepted BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_queue_mode_status
+    ON queue_entries(mode, status)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_queue_last_seen
+    ON queue_entries(last_seen_ms)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_presence_last_seen
+    ON presence(last_seen_ms)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_match_players_match_id
+    ON match_players(match_id)
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      steam_id VARCHAR(32) NOT NULL UNIQUE,
+      persona_name TEXT,
+      profile_url TEXT,
+      avatar_url TEXT,
+      avatar_medium_url TEXT,
+      avatar_full_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS launcher_links (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      client_id TEXT NOT NULL UNIQUE,
+      nickname TEXT,
+      linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_links_user_id
+    ON launcher_links(user_id)
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS launcher_link_codes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      code VARCHAR(16) NOT NULL UNIQUE,
+      client_id TEXT NOT NULL,
+      nickname TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      consumed_at TIMESTAMPTZ,
+      consumed_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_link_codes_code
+    ON launcher_link_codes(code)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_link_codes_client_id
+    ON launcher_link_codes(client_id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_link_codes_expires_at
+    ON launcher_link_codes(expires_at)
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS launcher_link_tokens (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      token TEXT NOT NULL UNIQUE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      consumed_at TIMESTAMPTZ
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_link_tokens_token
+    ON launcher_link_tokens(token)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_launcher_link_tokens_user_id
+    ON launcher_link_tokens(user_id)
+  `);
+
+  // NEW: player profile / rank / season
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS player_profiles (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      mmr INTEGER NOT NULL DEFAULT 1000,
+      rank_name TEXT NOT NULL DEFAULT 'UNRANKED',
+      season_name TEXT NOT NULL DEFAULT 'TRUST Alpha Season',
+      wins INTEGER NOT NULL DEFAULT 0,
+      losses INTEGER NOT NULL DEFAULT 0,
+      matches_played INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
+async function ensurePlayerProfileByUserId(userId) {
+  await pool.query(
+    `
+    INSERT INTO player_profiles (
+      user_id,
+      mmr,
+      rank_name,
+      season_name,
+      wins,
+      losses,
+      matches_played,
+      updated_at
+    )
+    VALUES ($1, 1000, 'UNRANKED', 'TRUST Alpha Season', 0, 0, 0, NOW())
+    ON CONFLICT (user_id)
+    DO NOTHING
+    `,
+    [userId]
+  );
+}
+
+async function pingPresence(clientId, nickname) {
+  const existing = await pool.query(
+    `
+    SELECT client_id
+    FROM presence
+    WHERE client_id = $1
+    LIMIT 1
+    `,
+    [clientId]
+  );
+
+  if (existing.rows.length > 0) {
+    await pool.query(
+      `
+      UPDATE presence
+      SET nickname = $2,
+          last_seen_ms = $3
+      WHERE client_id = $1
+      `,
+      [clientId, nickname, nowMs()]
+    );
+  } else {
+    await pool.query(
+      `
+      INSERT INTO presence (client_id, nickname, last_seen_ms)
+      VALUES ($1, $2, $3)
+      `,
+      [clientId, nickname, nowMs()]
+    );
+  }
+}
+
+async function getOnlineCount() {
+  const cutoff = nowMs() - 30000;
+
+  const q = await pool.query(
+    `
+    SELECT COUNT(*)::int AS online_count
+    FROM presence
+    WHERE last_seen_ms >= $1
+    `,
+    [cutoff]
+  );
+
+  return q.rows[0]?.online_count || 0;
+}
+
+async function cleanupStaleQueueEntries() {
+  const cutoff = nowMs() - 45000;
+
+  await pool.query(
+    `
+    DELETE FROM queue_entries
+    WHERE last_seen_ms < $1
+      AND status = 'searching'
+    `,
+    [cutoff]
+  );
+}
+
+async function cleanupStalePresence() {
+  const cutoff = nowMs() - 60000;
+
+  await pool.query(
+    `
+    DELETE FROM presence
+    WHERE last_seen_ms < $1
+    `,
+    [cutoff]
+  );
+}
+
+async function cleanupExpiredLinkCodes() {
+  await pool.query(`
+    DELETE FROM launcher_link_codes
+    WHERE expires_at < NOW() - INTERVAL '1 day'
+  `);
+}
+
+async function cleanupExpiredLauncherLinkTokens() {
+  await pool.query(`
+    DELETE FROM launcher_link_tokens
+    WHERE expires_at < NOW() - INTERVAL '1 day'
+  `);
+}
+
+async function tryCreateMatch(mode) {
+  const need = requiredPlayers(mode);
+  if (!need) return null;
+
+  await cleanupStaleQueueEntries();
+
+  const cutoff = nowMs() - 45000;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const q = await client.query(
+      `
+      SELECT client_id, nickname
+      FROM queue_entries
+      WHERE mode = $1
+        AND status = 'searching'
+        AND last_seen_ms >= $2
+      ORDER BY joined_at ASC
+      LIMIT $3
+      FOR UPDATE
+      `,
+      [mode, cutoff, need]
+    );
+
+    if (q.rows.length < need) {
+      await client.query("ROLLBACK");
+      return null;
+    }
+
+    const matchId = newMatchId();
+
+    await client.query(
+      `
+      INSERT INTO matches (id, mode, status, created_at)
+      VALUES ($1, $2, 'found', NOW())
+      `,
+      [matchId, mode]
+    );
+
+    for (const row of q.rows) {
+      await client.query(
+        `
+        INSERT INTO match_players (match_id, client_id, nickname, accepted, created_at)
+        VALUES ($1, $2, $3, FALSE, NOW())
+        `,
+        [matchId, row.client_id, row.nickname]
+      );
+
+      await client.query(
+        `
+        UPDATE queue_entries
+        SET status = 'match_found',
+            match_id = $1,
+            updated_at = NOW()
+        WHERE client_id = $2
+        `,
+        [matchId, row.client_id]
+      );
+    }
+
+    await client.query("COMMIT");
+    return matchId;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function recomputeMatchStatus(matchId) {
+  const players = await pool.query(
+    `
+    SELECT accepted
+    FROM match_players
+    WHERE match_id = $1
+    `,
+    [matchId]
+  );
+
+  if (players.rows.length === 0) return;
+
+  const allAccepted = players.rows.every((p) => p.accepted === true);
+
+  if (allAccepted) {
+    await pool.query(
+      `
+      UPDATE matches
+      SET status = 'ready'
+      WHERE id = $1
+      `,
+      [matchId]
+    );
+
+    await pool.query(
+      `
+      UPDATE queue_entries
+      SET status = 'accepted',
+          updated_at = NOW()
+      WHERE match_id = $1
+      `,
+      [matchId]
+    );
+  }
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "trust-backend",
+    message: "TRUST backend is running"
+  });
+});
+
+app.get("/health", async (req, res) => {
+  const onlineCount = await getOnlineCount();
+
+  res.json({
+    ok: true,
+    status: "online",
+    onlineCount,
+    timestamp: Date.now()
+  });
+});
+
+app.get("/config", (req, res) => {
+  res.json({
+    ok: true,
+    config: launcherConfig
+  });
+});
+
+app.post("/presence/ping", async (req, res) => {
+  try {
+    const { clientId, nickname } = req.body || {};
+
+    if (!clientId || !nickname) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_fields"
+      });
+    }
+
+    await pingPresence(clientId, nickname);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("presence ping error:", err);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+app.post("/queue/join", async (req, res) => {
+  try {
+    if (launcherConfig.maintenance) {
+      return res.status(503).json({
+        ok: false,
+        error: "maintenance"
+      });
+    }
+
+    if (!launcherConfig.matchmakingEnabled) {
+      return res.status(503).json({
+        ok: false,
+        error: "matchmaking_disabled"
+      });
+    }
+
+    const { clientId, nickname, mode } = req.body || {};
+
+    if (!clientId || !nickname || !mode) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_fields"
+      });
+    }
+
+    if (mode !== "2x2" && mode !== "5x5") {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_mode"
+      });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO queue_entries (client_id, nickname, mode, status, match_id, joined_at, updated_at, last_seen_ms)
+      VALUES ($1, $2, $3, 'searching', NULL, NOW(), NOW(), $4)
+      ON CONFLICT (client_id)
+      DO UPDATE SET
+        nickname = EXCLUDED.nickname,
+        mode = EXCLUDED.mode,
+        status = 'searching',
+        match_id = NULL,
+        updated_at = NOW(),
+        last_seen_ms = EXCLUDED.last_seen_ms
+      `,
+      [clientId, nickname, mode, nowMs()]
+    );
+
+    const matchId = await tryCreateMatch(mode);
+
+    res.json({
+      ok: true,
+      state: matchId ? "match_found" : "searching",
+      matchId: matchId || null
+    });
+  } catch (err) {
+    console.error("join error:", err);
+    res.status(500).json({
+      ok: false,
+      error: "internal_error"
+    });
+  }
+});
+
+app.post("/queue/leave", async (req, res) => {
+  try {
+    const { clientId } = req.body || {};
+
+    if (!clientId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_client_id"
+      });
+    }
+
+    await pool.query(
+      `
+      DELETE FROM queue_entries
+      WHERE client_id = $1
+      `,
+      [clientId]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("leave error:", err);
+    res.status(500).json({
+      ok: false,
+      error: "internal_error"
+    });
+  }
+});
+
+app.get("/queue/status", async (req, res) => {
+  try {
+    const clientId = req.query.clientId;
+    if (!clientId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_client_id"
+      });
+    }
+
+    const q = await pool.query(
+      `
+      SELECT client_id, nickname, mode, status, match_id
+      FROM queue_entries
+      WHERE client_id = $1
+      LIMIT 1
+      `,
+      [clientId]
+    );
+
+    if (q.rows.length === 0) {
+      return res.json({
+        ok: true,
+        state: "idle"
+      });
+    }
+
+    const row = q.rows[0];
+
+    if (!row.match_id) {
+      return res.json({
+        ok: true,
+        state: row.status
+      });
+    }
+
+    const mp = await pool.query(
+      `
+      SELECT COUNT(*)::int AS total_players,
+             COUNT(*) FILTER (WHERE accepted = TRUE)::int AS accepted_players
+      FROM match_players
+      WHERE match_id = $1
+      `,
+      [row.match_id]
+    );
+
+    const matchInfo = await pool.query(
+      `
+      SELECT status, mode
+      FROM matches
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [row.match_id]
+    );
+
+    const totalPlayers = mp.rows[0]?.total_players || 0;
+    const acceptedPlayers = mp.rows[0]?.accepted_players || 0;
+    const matchStatus = matchInfo.rows[0]?.status || row.status;
+
+    let state = row.status;
+    if (matchStatus === "ready") {
+      state = "accepted";
+    } else if (row.status === "accepted") {
+      state = acceptedPlayers < totalPlayers ? "accepted_waiting_others" : "accepted";
+    }
+
+    return res.json({
+      ok: true,
+      state,
+      matchId: row.match_id,
+      totalPlayers,
+      acceptedPlayers,
+      mode: matchInfo.rows[0]?.mode || row.mode
+    });
+  } catch (err) {
+    console.error("queue status error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error"
+    });
+  }
+});
+
+app.post("/match/accept", async (req, res) => {
+  try {
+    const { clientId, matchId } = req.body || {};
+
+    if (!clientId || !matchId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_fields"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE match_players
+      SET accepted = TRUE
+      WHERE match_id = $1 AND client_id = $2
+      `,
+      [matchId, clientId]
+    );
+
+    await pool.query(
+      `
+      UPDATE queue_entries
+      SET status = 'accepted',
+          updated_at = NOW()
+      WHERE client_id = $1
+      `,
+      [clientId]
+    );
+
+    await recomputeMatchStatus(matchId);
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("match accept error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error"
+    });
+  }
+});
+
+app.post("/match/decline", async (req, res) => {
+  try {
+    const { clientId, matchId } = req.body || {};
+
+    if (!clientId || !matchId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_fields"
+      });
+    }
+
+    await pool.query(
+      `
+      DELETE FROM queue_entries
+      WHERE client_id = $1
+      `,
+      [clientId]
+    );
+
+    await pool.query(
+      `
+      UPDATE matches
+      SET status = 'cancelled'
+      WHERE id = $1
+      `,
+      [matchId]
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("match decline error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error"
+    });
+  }
+});
+
+app.get("/match/:matchId", async (req, res) => {
+  try {
+    const matchId = req.params.matchId;
+
+    const matchQ = await pool.query(
+      `
+      SELECT id, mode, status
+      FROM matches
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [matchId]
+    );
+
+    if (matchQ.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "match_not_found"
+      });
+    }
+
+    const playersQ = await pool.query(
+      `
+      SELECT client_id, nickname, accepted
+      FROM match_players
+      WHERE match_id = $1
+      ORDER BY id ASC
+      `,
+      [matchId]
+    );
+
+    return res.json({
+      ok: true,
+      matchId,
+      mode: matchQ.rows[0].mode,
+      status: matchQ.rows[0].status,
+      players: playersQ.rows.map((p) => ({
+        clientId: p.client_id,
+        nickname: p.nickname,
+        accepted: !!p.accepted
+      }))
+    });
+  } catch (err) {
+    console.error("match details error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error"
+    });
+  }
+});
+
+app.get("/auth/me", requireAuth, async (req, res) => {
+  try {
+    const q = await pool.query(
+      `
+      SELECT id, steam_id, persona_name, profile_url, avatar_full_url
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [req.session.userId]
+    );
+
+    const row = q.rows[0];
+    if (!row) {
+      return res.status(404).json({
+        ok: false,
+        error: "user_not_found"
+      });
+    }
+
+    res.json({
+      ok: true,
+      user: row
+    });
+  } catch (err) {
+    console.error("auth/me error:", err);
+    res.status(500).json({
+      ok: false,
+      error: "internal_error"
+    });
+  }
+});
+
+app.get("/auth/steam", (req, res) => {
+  try {
+    const state = createSteamLoginState(req);
+    const returnTo = `${BACKEND_BASE_URL}/auth/steam/callback?state=${encodeURIComponent(state)}`;
+    const url = buildSteamLoginUrl(returnTo);
+    res.redirect(url);
+  } catch (err) {
+    console.error("auth/steam error:", err);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+app.get("/auth/steam/callback", async (req, res) => {
+  try {
+    const state = String(req.query.state || "");
+    if (!validateSteamLoginState(req, state)) {
+      return res.status(400).send("Invalid Steam login state");
+    }
+
+    const steamId = await verifySteamOpenId(req.query);
+    const profile = await fetchSteamProfile(steamId);
+    const user = await upsertUserFromSteam(profile);
+
+    req.session.userId = user.id;
+    delete req.session.steamLoginState;
+
+    await ensurePlayerProfileByUserId(user.id);
+
+    return res.redirect(`${PUBLIC_SITE_URL}`);
+  } catch (err) {
+    console.error("auth/steam/callback error:", err);
+    return res.status(500).send("Steam login failed");
+  }
+});
+
+app.post("/auth/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.json({ ok: true });
+  });
+});
+
 app.post("/launcher/link/start", requireAuth, async (req, res) => {
   try {
     const token = newLauncherLinkToken();
@@ -320,6 +1165,8 @@ app.post("/launcher/link/complete", async (req, res) => {
         [row.user_id, clientId, typeof nickname === "string" ? nickname.trim() : null]
       );
 
+      await ensurePlayerProfileByUserId(row.user_id);
+
       await client.query(
         `
         UPDATE launcher_link_tokens
@@ -351,965 +1198,15 @@ app.post("/launcher/link/complete", async (req, res) => {
   }
 });
 
-async function cleanupExpiredLauncherLinkTokens() {
-  await pool.query(`
-    DELETE FROM launcher_link_tokens
-    WHERE expires_at < NOW() - INTERVAL '1 day'
-  `);
-}
-
-async function upsertUserFromSteam(profile) {
-  const result = await pool.query(
-    `
-    INSERT INTO users (
-      steam_id,
-      persona_name,
-      profile_url,
-      avatar_url,
-      avatar_medium_url,
-      avatar_full_url,
-      created_at,
-      updated_at
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-    ON CONFLICT (steam_id)
-    DO UPDATE SET
-      persona_name = EXCLUDED.persona_name,
-      profile_url = EXCLUDED.profile_url,
-      avatar_url = EXCLUDED.avatar_url,
-      avatar_medium_url = EXCLUDED.avatar_medium_url,
-      avatar_full_url = EXCLUDED.avatar_full_url,
-      updated_at = NOW()
-    RETURNING *
-    `,
-    [
-      profile.steamid,
-      profile.personaname,
-      profile.profileurl,
-      profile.avatar,
-      profile.avatarmedium,
-      profile.avatarfull
-    ]
-  );
-
-  return result.rows[0];
-}
-
-function requireAuth(req, res, next) {
-  if (!req.session.userId) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  next();
-}
-
-async function ensureSchema() {
-
-  await pool.query(`
-  CREATE TABLE IF NOT EXISTS launcher_link_tokens (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    token TEXT NOT NULL UNIQUE,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL,
-    consumed_at TIMESTAMPTZ
-  )
-`);
-
-  await pool.query(`
-  CREATE INDEX IF NOT EXISTS idx_launcher_link_tokens_token
-  ON launcher_link_tokens(token)
-`);
-
-  await pool.query(`
-  CREATE INDEX IF NOT EXISTS idx_launcher_link_tokens_user_id
-  ON launcher_link_tokens(user_id)
-`);
-
-  await pool.query(`
-    CREATE EXTENSION IF NOT EXISTS pgcrypto
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS presence (
-      client_id TEXT PRIMARY KEY,
-      nickname TEXT NOT NULL,
-      last_seen_ms BIGINT NOT NULL DEFAULT 0
-    )
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS queue_entries (
-      client_id TEXT NOT NULL,
-      nickname TEXT NOT NULL,
-      mode TEXT NOT NULL,
-      status TEXT NOT NULL,
-      match_id TEXT,
-      joined_at DATE NOT NULL DEFAULT CURRENT_DATE,
-      updated_at DATE NOT NULL DEFAULT CURRENT_DATE,
-      last_seen_ms BIGINT NOT NULL DEFAULT 0
-    )
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS matches (
-      id TEXT PRIMARY KEY,
-      mode TEXT NOT NULL,
-      status TEXT NOT NULL,
-      created_at DATE NOT NULL DEFAULT CURRENT_DATE
-    )
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS match_players (
-      id SERIAL PRIMARY KEY,
-      match_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      nickname TEXT NOT NULL,
-      accepted BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at DATE NOT NULL DEFAULT CURRENT_DATE
-    )
-  `);
-
-  await pool.query(`
-    ALTER TABLE queue_entries
-    ADD COLUMN IF NOT EXISTS match_id TEXT
-  `);
-
-  await pool.query(`
-    ALTER TABLE queue_entries
-    ADD COLUMN IF NOT EXISTS joined_at DATE NOT NULL DEFAULT CURRENT_DATE
-  `);
-
-  await pool.query(`
-    ALTER TABLE queue_entries
-    ADD COLUMN IF NOT EXISTS updated_at DATE NOT NULL DEFAULT CURRENT_DATE
-  `);
-
-  await pool.query(`
-    ALTER TABLE queue_entries
-    ADD COLUMN IF NOT EXISTS last_seen_ms BIGINT NOT NULL DEFAULT 0
-  `);
-
-  try {
-    await pool.query(`
-      ALTER TABLE queue_entries
-      ALTER COLUMN match_id DROP NOT NULL
-    `);
-  } catch (_) { }
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_queue_mode_status
-    ON queue_entries(mode, status)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_queue_last_seen
-    ON queue_entries(last_seen_ms)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_presence_last_seen
-    ON presence(last_seen_ms)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_match_players_match_id
-    ON match_players(match_id)
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      steam_id VARCHAR(32) NOT NULL UNIQUE,
-      persona_name TEXT,
-      profile_url TEXT,
-      avatar_url TEXT,
-      avatar_medium_url TEXT,
-      avatar_full_url TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS launcher_links (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      client_id TEXT NOT NULL UNIQUE,
-      nickname TEXT,
-      linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_launcher_links_user_id
-    ON launcher_links(user_id)
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS launcher_link_codes (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      code VARCHAR(16) NOT NULL UNIQUE,
-      client_id TEXT NOT NULL,
-      nickname TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      expires_at TIMESTAMPTZ NOT NULL,
-      consumed_at TIMESTAMPTZ,
-      consumed_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL
-    )
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_launcher_link_codes_code
-    ON launcher_link_codes(code)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_launcher_link_codes_client_id
-    ON launcher_link_codes(client_id)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_launcher_link_codes_expires_at
-    ON launcher_link_codes(expires_at)
-  `);
-}
-
-async function pingPresence(clientId, nickname) {
-  const existing = await pool.query(
-    `
-    SELECT client_id
-    FROM presence
-    WHERE client_id = $1
-    LIMIT 1
-    `,
-    [clientId]
-  );
-
-  if (existing.rows.length > 0) {
-    await pool.query(
-      `
-      UPDATE presence
-      SET nickname = $2,
-          last_seen_ms = $3
-      WHERE client_id = $1
-      `,
-      [clientId, nickname, nowMs()]
-    );
-  } else {
-    await pool.query(
-      `
-      INSERT INTO presence (client_id, nickname, last_seen_ms)
-      VALUES ($1, $2, $3)
-      `,
-      [clientId, nickname, nowMs()]
-    );
-  }
-}
-
-async function getOnlineCount() {
-  const cutoff = nowMs() - 30000;
-
-  const q = await pool.query(
-    `
-    SELECT COUNT(*)::int AS online_count
-    FROM presence
-    WHERE last_seen_ms >= $1
-    `,
-    [cutoff]
-  );
-
-  return q.rows[0]?.online_count || 0;
-}
-
-async function cleanupStaleQueueEntries() {
-  const cutoff = nowMs() - 45000;
-
-  await pool.query(
-    `
-    DELETE FROM queue_entries
-    WHERE last_seen_ms < $1
-      AND status = 'searching'
-    `,
-    [cutoff]
-  );
-}
-
-async function cleanupStalePresence() {
-  const cutoff = nowMs() - 60000;
-
-  await pool.query(
-    `
-    DELETE FROM presence
-    WHERE last_seen_ms < $1
-    `,
-    [cutoff]
-  );
-}
-
-async function cleanupExpiredLinkCodes() {
-  await pool.query(
-    `
-    DELETE FROM launcher_link_codes
-    WHERE expires_at < NOW() - INTERVAL '1 day'
-    `
-  );
-}
-
-async function tryCreateMatch(mode) {
-  const need = requiredPlayers(mode);
-  if (!need) return null;
-
-  await cleanupStaleQueueEntries();
-
-  const cutoff = nowMs() - 45000;
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    const q = await client.query(
-      `
-      SELECT client_id, nickname
-      FROM queue_entries
-      WHERE mode = $1
-        AND status = 'searching'
-        AND last_seen_ms >= $2
-      ORDER BY joined_at ASC
-      LIMIT $3
-      FOR UPDATE
-      `,
-      [mode, cutoff, need]
-    );
-
-    if (q.rows.length < need) {
-      await client.query("ROLLBACK");
-      return null;
-    }
-
-    const matchId = newMatchId();
-
-    await client.query(
-      `
-      INSERT INTO matches (id, mode, status, created_at)
-      VALUES ($1, $2, 'found', CURRENT_DATE)
-      `,
-      [matchId, mode]
-    );
-
-    for (const row of q.rows) {
-      await client.query(
-        `
-        INSERT INTO match_players (match_id, client_id, nickname, accepted, created_at)
-        VALUES ($1, $2, $3, FALSE, CURRENT_DATE)
-        `,
-        [matchId, row.client_id, row.nickname]
-      );
-
-      await client.query(
-        `
-        UPDATE queue_entries
-        SET status = 'match_found',
-            match_id = $1,
-            updated_at = CURRENT_DATE
-        WHERE client_id = $2
-        `,
-        [matchId, row.client_id]
-      );
-    }
-
-    await client.query("COMMIT");
-    return matchId;
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-async function recomputeMatchStatus(matchId) {
-  const players = await pool.query(
-    `
-    SELECT accepted
-    FROM match_players
-    WHERE match_id = $1
-    `,
-    [matchId]
-  );
-
-  if (players.rows.length === 0) return;
-
-  const allAccepted = players.rows.every((p) => p.accepted === true);
-
-  if (allAccepted) {
-    await pool.query(
-      `
-      UPDATE matches
-      SET status = 'ready'
-      WHERE id = $1
-      `,
-      [matchId]
-    );
-
-    await pool.query(
-      `
-      UPDATE queue_entries
-      SET status = 'accepted',
-          updated_at = CURRENT_DATE
-      WHERE match_id = $1
-      `,
-      [matchId]
-    );
-  }
-}
-
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "trust-backend",
-    message: "TRUST backend is running",
-    allowedOrigins: ALLOWED_ORIGINS
-  });
-});
-
-app.get("/health", async (req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    const onlineCount = await getOnlineCount();
-
-    res.json({
-      ok: true,
-      status: "online",
-      timestamp: Date.now(),
-      database: "connected",
-      onlineCount
-    });
-  } catch (err) {
-    console.error("health db error:", err);
-    res.status(500).json({
-      ok: false,
-      status: "degraded",
-      timestamp: Date.now(),
-      database: "disconnected",
-      onlineCount: 0
-    });
-  }
-});
-
-app.get("/version", (req, res) => {
-  res.json({
-    ok: true,
-    version: launcherConfig.latestVersion,
-    minSupportedVersion: launcherConfig.minSupportedVersion
-  });
-});
-
-app.get("/motd", (req, res) => {
-  res.json({
-    ok: true,
-    motd: launcherConfig.motd
-  });
-});
-
-app.get("/config", (req, res) => {
-  res.json({
-    ok: true,
-    config: launcherConfig
-  });
-});
-
-app.get("/auth/me", async (req, res) => {
-  try {
-    if (!req.session.userId) {
-      return res.json({
-        ok: true,
-        authenticated: false,
-        user: null
-      });
-    }
-
-    const result = await pool.query(
-      `
-      SELECT
-        id,
-        steam_id,
-        persona_name,
-        profile_url,
-        avatar_full_url,
-        created_at,
-        updated_at
-      FROM users
-      WHERE id = $1
-      LIMIT 1
-      `,
-      [req.session.userId]
-    );
-
-    const user = result.rows[0] || null;
-
-    return res.json({
-      ok: true,
-      authenticated: !!user,
-      user
-    });
-  } catch (err) {
-    console.error("auth me error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      details: err.message
-    });
-  }
-});
-
-app.get("/auth/steam", async (req, res) => {
-  try {
-    if (!BACKEND_BASE_URL || !PUBLIC_SITE_URL) {
-      return res.status(500).send("Missing BACKEND_BASE_URL or PUBLIC_SITE_URL");
-    }
-
-    const state = createSteamLoginState(req);
-    const returnTo =
-      `${BACKEND_BASE_URL}/auth/steam/callback?state=${encodeURIComponent(state)}`;
-
-    const loginUrl = buildSteamLoginUrl(returnTo);
-
-    req.session.save((err) => {
-      if (err) {
-        console.error("session save before steam redirect error:", err);
-        return res.status(500).send("Failed to initialize Steam login session");
-      }
-
-      return res.redirect(loginUrl);
-    });
-  } catch (err) {
-    console.error("auth steam error:", err);
-    return res.status(500).send("Steam login init failed");
-  }
-});
-
-app.get("/auth/steam/callback", async (req, res) => {
-  try {
-    const state = req.query.state;
-
-    if (!validateSteamLoginState(req, state)) {
-      console.error("steam callback invalid state", {
-        gotState: state,
-        hasSession: !!req.session,
-        storedState: req.session?.steamLoginState || null
-      });
-      return res.redirect(`${PUBLIC_SITE_URL}/?login=error`);
-    }
-
-    const steamId = await verifySteamOpenId(req.query);
-    const profile = await fetchSteamProfile(steamId);
-    const user = await upsertUserFromSteam(profile);
-
-    req.session.userId = user.id;
-    delete req.session.steamLoginState;
-
-    req.session.save((err) => {
-      if (err) {
-        console.error("session save after steam callback error:", err);
-        return res.redirect(`${PUBLIC_SITE_URL}/?login=error`);
-      }
-
-      return res.redirect(`${PUBLIC_SITE_URL}/?login=success`);
-    });
-  } catch (err) {
-    console.error("steam callback error:", err);
-    return res.redirect(`${PUBLIC_SITE_URL}/?login=error`);
-  }
-});
-
-app.post("/auth/logout", (req, res) => {
-  req.session.destroy(() => {
-    res.clearCookie("trust.sid");
-    res.json({ ok: true });
-  });
-});
-
-app.post("/presence/ping", async (req, res) => {
-  try {
-    const { clientId, nickname } = req.body;
-
-    if (!clientId || !nickname) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_fields"
-      });
-    }
-
-    await pingPresence(clientId, nickname);
-
-    res.json({
-      ok: true
-    });
-  } catch (err) {
-    console.error("presence ping error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      details: err.message
-    });
-  }
-});
-
-app.post("/queue/join", async (req, res) => {
-  try {
-    if (launcherConfig.maintenance) {
-      return res.status(503).json({ ok: false, error: "maintenance" });
-    }
-
-    if (!launcherConfig.matchmakingEnabled) {
-      return res.status(503).json({ ok: false, error: "matchmaking_disabled" });
-    }
-
-    const { clientId, nickname, mode } = req.body;
-
-    if (!clientId || !nickname || !mode) {
-      return res.status(400).json({ ok: false, error: "missing_fields" });
-    }
-
-    if (mode !== "2x2" && mode !== "5x5") {
-      return res.status(400).json({ ok: false, error: "invalid_mode" });
-    }
-
-    await pingPresence(clientId, nickname);
-
-    const existing = await pool.query(
-      `
-      SELECT client_id
-      FROM queue_entries
-      WHERE client_id = $1
-      LIMIT 1
-      `,
-      [clientId]
-    );
-
-    if (existing.rows.length > 0) {
-      await pool.query(
-        `
-        UPDATE queue_entries
-        SET nickname = $2,
-            mode = $3,
-            status = 'searching',
-            match_id = NULL,
-            updated_at = CURRENT_DATE,
-            last_seen_ms = $4
-        WHERE client_id = $1
-        `,
-        [clientId, nickname, mode, nowMs()]
-      );
-    } else {
-      await pool.query(
-        `
-        INSERT INTO queue_entries (client_id, nickname, mode, status, match_id, joined_at, updated_at, last_seen_ms)
-        VALUES ($1, $2, $3, 'searching', NULL, CURRENT_DATE, CURRENT_DATE, $4)
-        `,
-        [clientId, nickname, mode, nowMs()]
-      );
-    }
-
-    const matchId = await tryCreateMatch(mode);
-
-    res.json({
-      ok: true,
-      state: matchId ? "match_found" : "searching",
-      matchId: matchId || null
-    });
-  } catch (err) {
-    console.error("join error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      details: err.message
-    });
-  }
-});
-
-app.post("/queue/leave", async (req, res) => {
-  try {
-    const { clientId } = req.body;
-
-    if (!clientId) {
-      return res.status(400).json({ ok: false, error: "missing_client_id" });
-    }
-
-    await pool.query(
-      `
-      DELETE FROM queue_entries
-      WHERE client_id = $1
-      `,
-      [clientId]
-    );
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("leave error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      details: err.message
-    });
-  }
-});
-
-app.get("/queue/status", async (req, res) => {
-  try {
-    const clientId = req.query.clientId;
-    const nickname = req.query.nickname || "player";
-
-    if (!clientId) {
-      return res.status(400).json({ ok: false, error: "missing_client_id" });
-    }
-
-    await pingPresence(clientId, nickname);
-
-    const q = await pool.query(
-      `
-      SELECT client_id, nickname, mode, status, match_id
-      FROM queue_entries
-      WHERE client_id = $1
-      LIMIT 1
-      `,
-      [clientId]
-    );
-
-    if (q.rows.length === 0) {
-      return res.json({
-        ok: true,
-        state: "idle",
-        totalPlayers: 0,
-        acceptedPlayers: 0
-      });
-    }
-
-    const row = q.rows[0];
-
-    await pool.query(
-      `
-      UPDATE queue_entries
-      SET last_seen_ms = $2,
-          updated_at = CURRENT_DATE
-      WHERE client_id = $1
-      `,
-      [clientId, nowMs()]
-    );
-
-    if (!row.match_id) {
-      return res.json({
-        ok: true,
-        state: row.status,
-        totalPlayers: 0,
-        acceptedPlayers: 0
-      });
-    }
-
-    const mp = await pool.query(
-      `
-      SELECT
-        COUNT(*)::int AS total_players,
-        COUNT(*) FILTER (WHERE accepted = TRUE)::int AS accepted_players,
-        COUNT(*) FILTER (WHERE client_id = $2 AND accepted = TRUE)::int AS self_accepted
-      FROM match_players
-      WHERE match_id = $1
-      `,
-      [row.match_id, clientId]
-    );
-
-    const matchInfo = await pool.query(
-      `
-      SELECT status, mode
-      FROM matches
-      WHERE id = $1
-      LIMIT 1
-      `,
-      [row.match_id]
-    );
-
-    if (matchInfo.rows.length === 0) {
-      return res.json({
-        ok: true,
-        state: "idle",
-        totalPlayers: 0,
-        acceptedPlayers: 0
-      });
-    }
-
-    const totalPlayers = mp.rows[0]?.total_players || 0;
-    const acceptedPlayers = mp.rows[0]?.accepted_players || 0;
-    const selfAccepted = (mp.rows[0]?.self_accepted || 0) > 0;
-
-    const matchStatus = matchInfo.rows[0].status;
-    const mode = matchInfo.rows[0].mode;
-
-    let state = "match_found";
-
-    if (matchStatus === "ready") {
-      state = "accepted";
-    } else if (matchStatus === "cancelled") {
-      state = "idle";
-    } else if (selfAccepted) {
-      state = "accepted_waiting_others";
-    }
-
-    return res.json({
-      ok: true,
-      state,
-      matchId: row.match_id,
-      mode,
-      matchStatus,
-      totalPlayers,
-      acceptedPlayers
-    });
-  } catch (err) {
-    console.error("status error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      details: err.message
-    });
-  }
-});
-
-app.post("/match/accept", async (req, res) => {
-  try {
-    const { clientId, matchId } = req.body;
-
-    if (!clientId || !matchId) {
-      return res.status(400).json({ ok: false, error: "missing_fields" });
-    }
-
-    await pool.query(
-      `
-      UPDATE match_players
-      SET accepted = TRUE
-      WHERE client_id = $1 AND match_id = $2
-      `,
-      [clientId, matchId]
-    );
-
-    await pool.query(
-      `
-      UPDATE queue_entries
-      SET updated_at = CURRENT_DATE,
-          last_seen_ms = $2
-      WHERE client_id = $1
-      `,
-      [clientId, nowMs()]
-    );
-
-    await recomputeMatchStatus(matchId);
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("accept error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      details: err.message
-    });
-  }
-});
-
-app.post("/match/decline", async (req, res) => {
-  try {
-    const { clientId, matchId } = req.body;
-
-    if (!clientId || !matchId) {
-      return res.status(400).json({ ok: false, error: "missing_fields" });
-    }
-
-    await pool.query(
-      `
-      UPDATE matches
-      SET status = 'cancelled'
-      WHERE id = $1
-      `,
-      [matchId]
-    );
-
-    await pool.query(
-      `
-      DELETE FROM queue_entries
-      WHERE match_id = $1
-      `,
-      [matchId]
-    );
-
-    await pool.query(
-      `
-      DELETE FROM match_players
-      WHERE match_id = $1
-      `,
-      [matchId]
-    );
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("decline error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      details: err.message
-    });
-  }
-});
-
-app.get("/match/:matchId", async (req, res) => {
-  try {
-    const matchId = req.params.matchId;
-
-    const match = await pool.query(
-      `
-      SELECT id, mode, status, created_at
-      FROM matches
-      WHERE id = $1
-      LIMIT 1
-      `,
-      [matchId]
-    );
-
-    if (match.rows.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: "match_not_found"
-      });
-    }
-
-    const players = await pool.query(
-      `
-      SELECT client_id, nickname, accepted
-      FROM match_players
-      WHERE match_id = $1
-      ORDER BY id ASC
-      `,
-      [matchId]
-    );
-
-    res.json({
-      ok: true,
-      match: match.rows[0],
-      players: players.rows
-    });
-  } catch (err) {
-    console.error("match get error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error",
-      details: err.message
-    });
-  }
-});
-
-app.post("/launcher/link-code", async (req, res) => {
+app.post("/launcher/link/code/create", async (req, res) => {
   try {
     const { clientId, nickname } = req.body || {};
 
-    if (!clientId || typeof clientId !== "string") {
-      return res.status(400).json({ ok: false, error: "clientId is required" });
+    if (!clientId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_client_id"
+      });
     }
 
     const code = newLinkCode(8);
@@ -1396,6 +1293,8 @@ app.post("/launcher/link/confirm", requireAuth, async (req, res) => {
         [row.id, req.session.userId]
       );
 
+      await ensurePlayerProfileByUserId(req.session.userId);
+
       return res.json({
         ok: true,
         linked: true,
@@ -1422,6 +1321,8 @@ app.post("/launcher/link/confirm", requireAuth, async (req, res) => {
         `,
         [req.session.userId, row.client_id, row.nickname]
       );
+
+      await ensurePlayerProfileByUserId(req.session.userId);
 
       await client.query(
         `
@@ -1450,7 +1351,7 @@ app.post("/launcher/link/confirm", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("confirm link code error:", err);
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
       error: "internal_error",
       details: err.message
@@ -1460,7 +1361,14 @@ app.post("/launcher/link/confirm", requireAuth, async (req, res) => {
 
 app.get("/launcher/account/by-client/:clientId", async (req, res) => {
   try {
-    const { clientId } = req.params;
+    const clientId = String(req.params.clientId || "").trim();
+
+    if (!clientId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_client_id"
+      });
+    }
 
     const result = await pool.query(
       `
@@ -1481,24 +1389,27 @@ app.get("/launcher/account/by-client/:clientId", async (req, res) => {
       [clientId]
     );
 
-    const linked = result.rows[0] || null;
-
-    if (!linked) {
+    const row = result.rows[0];
+    if (!row) {
       return res.json({
         ok: true,
-        linked: false,
-        account: null
+        linked: false
       });
     }
 
     return res.json({
       ok: true,
       linked: true,
-      account: linked
+      client_id: row.client_id,
+      steam_id: row.steam_id,
+      persona_name: row.persona_name,
+      profile_url: row.profile_url,
+      avatar_full_url: row.avatar_full_url,
+      linked_at: row.linked_at
     });
   } catch (err) {
-    console.error("get linked account error:", err);
-    res.status(500).json({
+    console.error("launcher account by client error:", err);
+    return res.status(500).json({
       ok: false,
       error: "internal_error",
       details: err.message
@@ -1506,30 +1417,109 @@ app.get("/launcher/account/by-client/:clientId", async (req, res) => {
   }
 });
 
-async function start() {
+// NEW: launcher profile
+app.get("/launcher/profile/by-client/:clientId", async (req, res) => {
+  try {
+    const clientId = String(req.params.clientId || "").trim();
+
+    if (!clientId) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_client_id"
+      });
+    }
+
+    const accountResult = await pool.query(
+      `
+      SELECT
+        ll.client_id,
+        ll.user_id,
+        u.steam_id,
+        u.persona_name,
+        u.profile_url,
+        u.avatar_full_url
+      FROM launcher_links ll
+      JOIN users u ON u.id = ll.user_id
+      WHERE ll.client_id = $1
+      LIMIT 1
+      `,
+      [clientId]
+    );
+
+    const row = accountResult.rows[0];
+    if (!row) {
+      return res.json({
+        ok: true,
+        linked: false
+      });
+    }
+
+    await ensurePlayerProfileByUserId(row.user_id);
+
+    const profileResult = await pool.query(
+      `
+      SELECT
+        user_id,
+        mmr,
+        rank_name,
+        season_name,
+        wins,
+        losses,
+        matches_played,
+        updated_at
+      FROM player_profiles
+      WHERE user_id = $1
+      LIMIT 1
+      `,
+      [row.user_id]
+    );
+
+    const profile = profileResult.rows[0];
+
+    return res.json({
+      ok: true,
+      linked: true,
+      client_id: row.client_id,
+      steam_id: row.steam_id,
+      persona_name: row.persona_name,
+      profile_url: row.profile_url,
+      avatar_full_url: row.avatar_full_url,
+      mmr: profile?.mmr ?? 1000,
+      rank_name: profile?.rank_name ?? "UNRANKED",
+      season_name: profile?.season_name ?? "TRUST Alpha Season",
+      wins: profile?.wins ?? 0,
+      losses: profile?.losses ?? 0,
+      matches_played: profile?.matches_played ?? 0,
+      updated_at: profile?.updated_at ?? null
+    });
+  } catch (err) {
+    console.error("launcher profile by client error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      details: err.message
+    });
+  }
+});
+
+async function boot() {
   try {
     await ensureSchema();
 
-    console.log("Allowed CORS origins:", ALLOWED_ORIGINS);
-
     setInterval(() => {
-
-      cleanupExpiredLauncherLinkTokens().catch(err =>
-        console.error("cleanup launcher link tokens error:", err)
-      );
-
-      cleanupStaleQueueEntries().catch(err => console.error("cleanup queue error:", err));
-      cleanupStalePresence().catch(err => console.error("cleanup presence error:", err));
-      cleanupExpiredLinkCodes().catch(err => console.error("cleanup link codes error:", err));
-    }, 10000);
+      cleanupStalePresence().catch((err) => console.error("cleanupStalePresence:", err));
+      cleanupStaleQueueEntries().catch((err) => console.error("cleanupStaleQueueEntries:", err));
+      cleanupExpiredLinkCodes().catch((err) => console.error("cleanupExpiredLinkCodes:", err));
+      cleanupExpiredLauncherLinkTokens().catch((err) => console.error("cleanupExpiredLauncherLinkTokens:", err));
+    }, 30000);
 
     app.listen(PORT, () => {
-      console.log(`TRUST backend running on port ${PORT}`);
+      console.log(`TRUST backend listening on port ${PORT}`);
     });
   } catch (err) {
-    console.error("startup error:", err);
+    console.error("boot error:", err);
     process.exit(1);
   }
 }
 
-start();
+boot();
