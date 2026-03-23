@@ -97,6 +97,14 @@ function newMatchId() {
   return "match_" + crypto.randomBytes(8).toString("hex");
 }
 
+function newPartyCode() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = crypto.randomBytes(6);
+  let out = "TRUST-";
+  for (let i = 0; i < 6; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
 function nowMs() {
   return Date.now();
 }
@@ -118,7 +126,7 @@ function newLauncherLinkToken() {
 }
 
 function sha256(input) {
-  return crypto.createHash("sha256").update(input).digest("hex");
+  return crypto.createHash("sha256").update(String(input || "")).digest("hex");
 }
 
 function createSteamLoginState(req) {
@@ -268,9 +276,7 @@ function requireAuth(req, res, next) {
 }
 
 async function ensureSchema() {
-  await pool.query(`
-    CREATE EXTENSION IF NOT EXISTS pgcrypto
-  `);
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS presence (
@@ -411,7 +417,6 @@ async function ensureSchema() {
     ON launcher_link_tokens(user_id)
   `);
 
-  // NEW: player profile / rank / season
   await pool.query(`
     CREATE TABLE IF NOT EXISTS player_profiles (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -423,6 +428,55 @@ async function ensureSchema() {
       matches_played INTEGER NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS parties (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      party_code TEXT NOT NULL UNIQUE,
+      leader_client_id TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT '2x2',
+      visibility TEXT NOT NULL DEFAULT 'private',
+      password_hash TEXT,
+      status TEXT NOT NULL DEFAULT 'lobby',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_parties_party_code
+    ON parties(party_code)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_parties_status_visibility
+    ON parties(status, visibility)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_parties_leader_client_id
+    ON parties(leader_client_id)
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS party_members (
+      id BIGSERIAL PRIMARY KEY,
+      party_id UUID NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+      client_id TEXT NOT NULL UNIQUE,
+      nickname TEXT NOT NULL,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_party_members_party_id
+    ON party_members(party_id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_party_members_client_id
+    ON party_members(client_id)
   `);
 }
 
@@ -533,6 +587,126 @@ async function cleanupExpiredLauncherLinkTokens() {
   `);
 }
 
+async function cleanupStaleParties() {
+  const cutoff = nowMs() - 60000;
+
+  await pool.query(
+    `
+    DELETE FROM parties p
+    WHERE EXISTS (
+      SELECT 1
+      FROM party_members pm
+      WHERE pm.party_id = p.id
+        AND pm.client_id = p.leader_client_id
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM presence pr
+      WHERE pr.client_id = p.leader_client_id
+        AND pr.last_seen_ms >= $1
+    )
+    `,
+    [cutoff]
+  );
+}
+
+async function getPartyMembershipByClientId(clientId) {
+  const q = await pool.query(
+    `
+    SELECT
+      p.id AS party_id,
+      p.party_code,
+      p.leader_client_id,
+      p.mode,
+      p.visibility,
+      p.status,
+      p.password_hash,
+      pm.client_id,
+      pm.nickname
+    FROM party_members pm
+    JOIN parties p ON p.id = pm.party_id
+    WHERE pm.client_id = $1
+    LIMIT 1
+    `,
+    [clientId]
+  );
+
+  return q.rows[0] || null;
+}
+
+async function getPartyMembers(partyId) {
+  const q = await pool.query(
+    `
+    SELECT
+      pm.client_id,
+      pm.nickname,
+      (pm.client_id = p.leader_client_id) AS is_leader
+    FROM party_members pm
+    JOIN parties p ON p.id = pm.party_id
+    WHERE pm.party_id = $1
+    ORDER BY pm.joined_at ASC
+    `,
+    [partyId]
+  );
+
+  return q.rows.map((r) => ({
+    clientId: r.client_id,
+    nickname: r.nickname,
+    isLeader: !!r.is_leader
+  }));
+}
+
+async function getEffectivePartyStatus(partyId, fallbackStatus = "lobby") {
+  const q = await pool.query(
+    `
+    SELECT status, COUNT(*)::int AS cnt
+    FROM queue_entries
+    WHERE client_id IN (
+      SELECT client_id
+      FROM party_members
+      WHERE party_id = $1
+    )
+    GROUP BY status
+    `,
+    [partyId]
+  );
+
+  const statuses = new Set(q.rows.map((r) => r.status));
+
+  if (statuses.has("match_found")) return "match_found";
+  if (statuses.has("accepted")) return "match_found";
+  if (statuses.has("searching")) return "searching";
+
+  return fallbackStatus || "lobby";
+}
+
+async function isClientBusyWithSoloOrPartyQueue(clientId) {
+  const queueQ = await pool.query(
+    `
+    SELECT status
+    FROM queue_entries
+    WHERE client_id = $1
+    LIMIT 1
+    `,
+    [clientId]
+  );
+
+  return queueQ.rows.length > 0;
+}
+
+async function isClientLinked(clientId) {
+  const q = await pool.query(
+    `
+    SELECT 1
+    FROM launcher_links
+    WHERE client_id = $1
+    LIMIT 1
+    `,
+    [clientId]
+  );
+  return q.rows.length > 0;
+}
+
 async function tryCreateMatch(mode) {
   const need = requiredPlayers(mode);
   if (!need) return null;
@@ -641,6 +815,8 @@ async function recomputeMatchStatus(matchId) {
   }
 }
 
+// ------------------------ basic ------------------------
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -687,36 +863,31 @@ app.post("/presence/ping", async (req, res) => {
   }
 });
 
+// ------------------------ solo queue ------------------------
+
 app.post("/queue/join", async (req, res) => {
   try {
     if (launcherConfig.maintenance) {
-      return res.status(503).json({
-        ok: false,
-        error: "maintenance"
-      });
+      return res.status(503).json({ ok: false, error: "maintenance" });
     }
 
     if (!launcherConfig.matchmakingEnabled) {
-      return res.status(503).json({
-        ok: false,
-        error: "matchmaking_disabled"
-      });
+      return res.status(503).json({ ok: false, error: "matchmaking_disabled" });
     }
 
     const { clientId, nickname, mode } = req.body || {};
 
     if (!clientId || !nickname || !mode) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_fields"
-      });
+      return res.status(400).json({ ok: false, error: "missing_fields" });
     }
 
     if (mode !== "2x2" && mode !== "5x5") {
-      return res.status(400).json({
-        ok: false,
-        error: "invalid_mode"
-      });
+      return res.status(400).json({ ok: false, error: "invalid_mode" });
+    }
+
+    const partyMembership = await getPartyMembershipByClientId(clientId);
+    if (partyMembership) {
+      return res.status(409).json({ ok: false, error: "client_in_party" });
     }
 
     await pool.query(
@@ -744,10 +915,7 @@ app.post("/queue/join", async (req, res) => {
     });
   } catch (err) {
     console.error("join error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error"
-    });
+    res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
 
@@ -756,10 +924,7 @@ app.post("/queue/leave", async (req, res) => {
     const { clientId } = req.body || {};
 
     if (!clientId) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_client_id"
-      });
+      return res.status(400).json({ ok: false, error: "missing_client_id" });
     }
 
     await pool.query(
@@ -773,10 +938,7 @@ app.post("/queue/leave", async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error("leave error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error"
-    });
+    res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
 
@@ -784,10 +946,7 @@ app.get("/queue/status", async (req, res) => {
   try {
     const clientId = req.query.clientId;
     if (!clientId) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_client_id"
-      });
+      return res.status(400).json({ ok: false, error: "missing_client_id" });
     }
 
     const q = await pool.query(
@@ -801,10 +960,7 @@ app.get("/queue/status", async (req, res) => {
     );
 
     if (q.rows.length === 0) {
-      return res.json({
-        ok: true,
-        state: "idle"
-      });
+      return res.json({ ok: true, state: "idle" });
     }
 
     const row = q.rows[0];
@@ -812,7 +968,8 @@ app.get("/queue/status", async (req, res) => {
     if (!row.match_id) {
       return res.json({
         ok: true,
-        state: row.status
+        state: row.status,
+        matchStatus: row.status
       });
     }
 
@@ -853,26 +1010,23 @@ app.get("/queue/status", async (req, res) => {
       matchId: row.match_id,
       totalPlayers,
       acceptedPlayers,
-      mode: matchInfo.rows[0]?.mode || row.mode
+      mode: matchInfo.rows[0]?.mode || row.mode,
+      matchStatus
     });
   } catch (err) {
     console.error("queue status error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "internal_error"
-    });
+    return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
+
+// ------------------------ matches ------------------------
 
 app.post("/match/accept", async (req, res) => {
   try {
     const { clientId, matchId } = req.body || {};
 
     if (!clientId || !matchId) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_fields"
-      });
+      return res.status(400).json({ ok: false, error: "missing_fields" });
     }
 
     await pool.query(
@@ -899,10 +1053,7 @@ app.post("/match/accept", async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     console.error("match accept error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "internal_error"
-    });
+    return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
 
@@ -911,10 +1062,7 @@ app.post("/match/decline", async (req, res) => {
     const { clientId, matchId } = req.body || {};
 
     if (!clientId || !matchId) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_fields"
-      });
+      return res.status(400).json({ ok: false, error: "missing_fields" });
     }
 
     await pool.query(
@@ -937,10 +1085,7 @@ app.post("/match/decline", async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     console.error("match decline error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "internal_error"
-    });
+    return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
 
@@ -959,10 +1104,7 @@ app.get("/match/:matchId", async (req, res) => {
     );
 
     if (matchQ.rows.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: "match_not_found"
-      });
+      return res.status(404).json({ ok: false, error: "match_not_found" });
     }
 
     const playersQ = await pool.query(
@@ -988,12 +1130,11 @@ app.get("/match/:matchId", async (req, res) => {
     });
   } catch (err) {
     console.error("match details error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "internal_error"
-    });
+    return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
+
+// ------------------------ auth / steam ------------------------
 
 app.get("/auth/me", requireAuth, async (req, res) => {
   try {
@@ -1009,22 +1150,13 @@ app.get("/auth/me", requireAuth, async (req, res) => {
 
     const row = q.rows[0];
     if (!row) {
-      return res.status(404).json({
-        ok: false,
-        error: "user_not_found"
-      });
+      return res.status(404).json({ ok: false, error: "user_not_found" });
     }
 
-    res.json({
-      ok: true,
-      user: row
-    });
+    res.json({ ok: true, user: row });
   } catch (err) {
     console.error("auth/me error:", err);
-    res.status(500).json({
-      ok: false,
-      error: "internal_error"
-    });
+    res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
 
@@ -1069,6 +1201,8 @@ app.post("/auth/logout", (req, res) => {
   });
 });
 
+// ------------------------ launcher linking ------------------------
+
 app.post("/launcher/link/start", requireAuth, async (req, res) => {
   try {
     const token = newLauncherLinkToken();
@@ -1105,10 +1239,7 @@ app.post("/launcher/link/complete", async (req, res) => {
     const { clientId, nickname, token } = req.body || {};
 
     if (!clientId || !token) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_fields"
-      });
+      return res.status(400).json({ ok: false, error: "missing_fields" });
     }
 
     const tokenResult = await pool.query(
@@ -1124,24 +1255,15 @@ app.post("/launcher/link/complete", async (req, res) => {
     const row = tokenResult.rows[0];
 
     if (!row) {
-      return res.status(400).json({
-        ok: false,
-        error: "invalid_token"
-      });
+      return res.status(400).json({ ok: false, error: "invalid_token" });
     }
 
     if (row.consumed_at) {
-      return res.status(400).json({
-        ok: false,
-        error: "token_already_used"
-      });
+      return res.status(400).json({ ok: false, error: "token_already_used" });
     }
 
     if (new Date(row.expires_at).getTime() < Date.now()) {
-      return res.status(400).json({
-        ok: false,
-        error: "token_expired"
-      });
+      return res.status(400).json({ ok: false, error: "token_expired" });
     }
 
     const client = await pool.connect();
@@ -1165,7 +1287,23 @@ app.post("/launcher/link/complete", async (req, res) => {
         [row.user_id, clientId, typeof nickname === "string" ? nickname.trim() : null]
       );
 
-      await ensurePlayerProfileByUserId(row.user_id);
+      await client.query(
+        `
+        INSERT INTO player_profiles (
+          user_id,
+          mmr,
+          rank_name,
+          season_name,
+          wins,
+          losses,
+          matches_played,
+          updated_at
+        )
+        VALUES ($1, 1000, 'UNRANKED', 'TRUST Alpha Season', 0, 0, 0, NOW())
+        ON CONFLICT (user_id) DO NOTHING
+        `,
+        [row.user_id]
+      );
 
       await client.query(
         `
@@ -1184,10 +1322,7 @@ app.post("/launcher/link/complete", async (req, res) => {
       client.release();
     }
 
-    return res.json({
-      ok: true,
-      linked: true
-    });
+    return res.json({ ok: true, linked: true });
   } catch (err) {
     console.error("launcher link complete error:", err);
     return res.status(500).json({
@@ -1203,10 +1338,7 @@ app.post("/launcher/link/code/create", async (req, res) => {
     const { clientId, nickname } = req.body || {};
 
     if (!clientId) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_client_id"
-      });
+      return res.status(400).json({ ok: false, error: "missing_client_id" });
     }
 
     const code = newLinkCode(8);
@@ -1322,7 +1454,23 @@ app.post("/launcher/link/confirm", requireAuth, async (req, res) => {
         [req.session.userId, row.client_id, row.nickname]
       );
 
-      await ensurePlayerProfileByUserId(req.session.userId);
+      await client.query(
+        `
+        INSERT INTO player_profiles (
+          user_id,
+          mmr,
+          rank_name,
+          season_name,
+          wins,
+          losses,
+          matches_played,
+          updated_at
+        )
+        VALUES ($1, 1000, 'UNRANKED', 'TRUST Alpha Season', 0, 0, 0, NOW())
+        ON CONFLICT (user_id) DO NOTHING
+        `,
+        [req.session.userId]
+      );
 
       await client.query(
         `
@@ -1364,10 +1512,7 @@ app.get("/launcher/account/by-client/:clientId", async (req, res) => {
     const clientId = String(req.params.clientId || "").trim();
 
     if (!clientId) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_client_id"
-      });
+      return res.status(400).json({ ok: false, error: "missing_client_id" });
     }
 
     const result = await pool.query(
@@ -1391,10 +1536,7 @@ app.get("/launcher/account/by-client/:clientId", async (req, res) => {
 
     const row = result.rows[0];
     if (!row) {
-      return res.json({
-        ok: true,
-        linked: false
-      });
+      return res.json({ ok: true, linked: false });
     }
 
     return res.json({
@@ -1417,16 +1559,12 @@ app.get("/launcher/account/by-client/:clientId", async (req, res) => {
   }
 });
 
-// NEW: launcher profile
 app.get("/launcher/profile/by-client/:clientId", async (req, res) => {
   try {
     const clientId = String(req.params.clientId || "").trim();
 
     if (!clientId) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_client_id"
-      });
+      return res.status(400).json({ ok: false, error: "missing_client_id" });
     }
 
     const accountResult = await pool.query(
@@ -1448,10 +1586,7 @@ app.get("/launcher/profile/by-client/:clientId", async (req, res) => {
 
     const row = accountResult.rows[0];
     if (!row) {
-      return res.json({
-        ok: true,
-        linked: false
-      });
+      return res.json({ ok: true, linked: false });
     }
 
     await ensurePlayerProfileByUserId(row.user_id);
@@ -1502,6 +1637,617 @@ app.get("/launcher/profile/by-client/:clientId", async (req, res) => {
   }
 });
 
+// ------------------------ party ------------------------
+
+app.post("/party/create", async (req, res) => {
+  const clientDb = await pool.connect();
+  try {
+    const { clientId, nickname, visibility, password } = req.body || {};
+
+    if (!clientId || !nickname) {
+      return res.status(400).json({ ok: false, error: "missing_fields" });
+    }
+
+    if (visibility !== "public" && visibility !== "private") {
+      return res.status(400).json({ ok: false, error: "invalid_visibility" });
+    }
+
+    if (await isClientBusyWithSoloOrPartyQueue(clientId)) {
+      return res.status(409).json({ ok: false, error: "client_busy" });
+    }
+
+    if (await getPartyMembershipByClientId(clientId)) {
+      return res.status(409).json({ ok: false, error: "already_in_party" });
+    }
+
+    await clientDb.query("BEGIN");
+
+    const partyCode = newPartyCode();
+    const passwordHash = password ? sha256(password) : null;
+
+    const partyResult = await clientDb.query(
+      `
+      INSERT INTO parties (
+        party_code,
+        leader_client_id,
+        mode,
+        visibility,
+        password_hash,
+        status,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, '2x2', $3, $4, 'lobby', NOW(), NOW())
+      RETURNING id, party_code, status
+      `,
+      [partyCode, clientId, visibility, passwordHash]
+    );
+
+    const party = partyResult.rows[0];
+
+    await clientDb.query(
+      `
+      INSERT INTO party_members (
+        party_id,
+        client_id,
+        nickname,
+        joined_at
+      )
+      VALUES ($1, $2, $3, NOW())
+      `,
+      [party.id, clientId, String(nickname).trim()]
+    );
+
+    await clientDb.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      partyId: party.id,
+      partyCode: party.party_code,
+      status: party.status
+    });
+  } catch (err) {
+    await clientDb.query("ROLLBACK");
+    console.error("party/create error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  } finally {
+    clientDb.release();
+  }
+});
+
+app.post("/party/join", async (req, res) => {
+  const clientDb = await pool.connect();
+  try {
+    const { clientId, nickname, partyCode, partyId, password } = req.body || {};
+
+    if (!clientId || !nickname || (!partyCode && !partyId)) {
+      return res.status(400).json({ ok: false, error: "missing_fields" });
+    }
+
+    if (await isClientBusyWithSoloOrPartyQueue(clientId)) {
+      return res.status(409).json({ ok: false, error: "client_busy" });
+    }
+
+    if (await getPartyMembershipByClientId(clientId)) {
+      return res.status(409).json({ ok: false, error: "already_in_party" });
+    }
+
+    await clientDb.query("BEGIN");
+
+    const partyLookup = await clientDb.query(
+      partyId
+        ? `
+          SELECT *
+          FROM parties
+          WHERE id = $1
+          LIMIT 1
+          FOR UPDATE
+        `
+        : `
+          SELECT *
+          FROM parties
+          WHERE party_code = $1
+          LIMIT 1
+          FOR UPDATE
+        `,
+      [partyId || partyCode]
+    );
+
+    const party = partyLookup.rows[0];
+    if (!party) {
+      await clientDb.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "party_not_found" });
+    }
+
+    const effectiveStatus = await getEffectivePartyStatus(party.id, party.status);
+    if (effectiveStatus !== "lobby") {
+      await clientDb.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "party_not_joinable" });
+    }
+
+    const memberCountQ = await clientDb.query(
+      `
+      SELECT COUNT(*)::int AS cnt
+      FROM party_members
+      WHERE party_id = $1
+      `,
+      [party.id]
+    );
+
+    const cnt = memberCountQ.rows[0]?.cnt || 0;
+    if (cnt >= 2) {
+      await clientDb.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "party_full" });
+    }
+
+    if (party.password_hash) {
+      if (!password || sha256(password) !== party.password_hash) {
+        await clientDb.query("ROLLBACK");
+        return res.status(403).json({ ok: false, error: "invalid_party_password" });
+      }
+    }
+
+    await clientDb.query(
+      `
+      INSERT INTO party_members (
+        party_id,
+        client_id,
+        nickname,
+        joined_at
+      )
+      VALUES ($1, $2, $3, NOW())
+      `,
+      [party.id, clientId, String(nickname).trim()]
+    );
+
+    await clientDb.query(
+      `
+      UPDATE parties
+      SET updated_at = NOW()
+      WHERE id = $1
+      `,
+      [party.id]
+    );
+
+    await clientDb.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      partyId: party.id,
+      partyCode: party.party_code,
+      status: "lobby"
+    });
+  } catch (err) {
+    await clientDb.query("ROLLBACK");
+    console.error("party/join error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  } finally {
+    clientDb.release();
+  }
+});
+
+app.post("/party/leave", async (req, res) => {
+  const clientDb = await pool.connect();
+  try {
+    const { clientId } = req.body || {};
+    if (!clientId) {
+      return res.status(400).json({ ok: false, error: "missing_client_id" });
+    }
+
+    const membership = await getPartyMembershipByClientId(clientId);
+    if (!membership) {
+      return res.json({ ok: true, status: "no_party" });
+    }
+
+    const effectiveStatus = await getEffectivePartyStatus(membership.party_id, membership.status);
+    if (effectiveStatus !== "lobby") {
+      return res.status(409).json({ ok: false, error: "party_not_in_lobby" });
+    }
+
+    await clientDb.query("BEGIN");
+
+    if (membership.leader_client_id === clientId) {
+      await clientDb.query(`DELETE FROM parties WHERE id = $1`, [membership.party_id]);
+      await clientDb.query("COMMIT");
+      return res.json({ ok: true, status: "disbanded" });
+    }
+
+    await clientDb.query(
+      `
+      DELETE FROM party_members
+      WHERE party_id = $1 AND client_id = $2
+      `,
+      [membership.party_id, clientId]
+    );
+
+    await clientDb.query(
+      `
+      UPDATE parties
+      SET updated_at = NOW()
+      WHERE id = $1
+      `,
+      [membership.party_id]
+    );
+
+    await clientDb.query("COMMIT");
+    return res.json({ ok: true, status: "left" });
+  } catch (err) {
+    await clientDb.query("ROLLBACK");
+    console.error("party/leave error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  } finally {
+    clientDb.release();
+  }
+});
+
+app.post("/party/disband", async (req, res) => {
+  try {
+    const { clientId } = req.body || {};
+    if (!clientId) {
+      return res.status(400).json({ ok: false, error: "missing_client_id" });
+    }
+
+    const membership = await getPartyMembershipByClientId(clientId);
+    if (!membership) {
+      return res.status(404).json({ ok: false, error: "party_not_found" });
+    }
+
+    const effectiveStatus = await getEffectivePartyStatus(membership.party_id, membership.status);
+    if (effectiveStatus !== "lobby") {
+      return res.status(409).json({ ok: false, error: "party_not_in_lobby" });
+    }
+
+    if (membership.leader_client_id !== clientId) {
+      return res.status(403).json({ ok: false, error: "not_party_leader" });
+    }
+
+    await pool.query(`DELETE FROM parties WHERE id = $1`, [membership.party_id]);
+
+    return res.json({ ok: true, status: "disbanded" });
+  } catch (err) {
+    console.error("party/disband error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+app.post("/party/kick", async (req, res) => {
+  const clientDb = await pool.connect();
+  try {
+    const { clientId, targetClientId } = req.body || {};
+    if (!clientId || !targetClientId) {
+      return res.status(400).json({ ok: false, error: "missing_fields" });
+    }
+
+    const membership = await getPartyMembershipByClientId(clientId);
+    if (!membership) {
+      return res.status(404).json({ ok: false, error: "party_not_found" });
+    }
+
+    if (membership.leader_client_id !== clientId) {
+      return res.status(403).json({ ok: false, error: "not_party_leader" });
+    }
+
+    if (targetClientId === clientId) {
+      return res.status(400).json({ ok: false, error: "cannot_kick_self" });
+    }
+
+    const effectiveStatus = await getEffectivePartyStatus(membership.party_id, membership.status);
+    if (effectiveStatus !== "lobby") {
+      return res.status(409).json({ ok: false, error: "party_not_in_lobby" });
+    }
+
+    await clientDb.query("BEGIN");
+
+    const targetCheck = await clientDb.query(
+      `
+      SELECT 1
+      FROM party_members
+      WHERE party_id = $1 AND client_id = $2
+      LIMIT 1
+      `,
+      [membership.party_id, targetClientId]
+    );
+
+    if (targetCheck.rows.length === 0) {
+      await clientDb.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "target_not_in_party" });
+    }
+
+    await clientDb.query(
+      `
+      DELETE FROM party_members
+      WHERE party_id = $1 AND client_id = $2
+      `,
+      [membership.party_id, targetClientId]
+    );
+
+    await clientDb.query(
+      `
+      UPDATE parties
+      SET updated_at = NOW()
+      WHERE id = $1
+      `,
+      [membership.party_id]
+    );
+
+    await clientDb.query("COMMIT");
+    return res.json({ ok: true, status: "kicked" });
+  } catch (err) {
+    await clientDb.query("ROLLBACK");
+    console.error("party/kick error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  } finally {
+    clientDb.release();
+  }
+});
+
+app.get("/party/status", async (req, res) => {
+  try {
+    const clientId = String(req.query.clientId || "").trim();
+    if (!clientId) {
+      return res.status(400).json({ ok: false, error: "missing_client_id" });
+    }
+
+    const membership = await getPartyMembershipByClientId(clientId);
+    if (!membership) {
+      return res.json({
+        ok: true,
+        inParty: false
+      });
+    }
+
+    const members = await getPartyMembers(membership.party_id);
+    const effectiveStatus = await getEffectivePartyStatus(membership.party_id, membership.status);
+
+    const leaderMember = members.find((m) => m.clientId === membership.leader_client_id);
+
+    return res.json({
+      ok: true,
+      inParty: true,
+      isLeader: membership.leader_client_id === clientId,
+      partyId: membership.party_id,
+      partyCode: membership.party_code,
+      status: effectiveStatus,
+      mode: membership.mode,
+      visibility: membership.visibility,
+      passwordProtected: !!membership.password_hash,
+      leaderClientId: membership.leader_client_id,
+      leaderNickname: leaderMember?.nickname || "",
+      members
+    });
+  } catch (err) {
+    console.error("party/status error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+app.get("/party/list", async (req, res) => {
+  try {
+    const cutoff = nowMs() - 60000;
+
+    const q = await pool.query(
+      `
+      SELECT
+        p.id AS party_id,
+        p.party_code,
+        p.mode,
+        p.visibility,
+        p.password_hash,
+        p.status,
+        p.leader_client_id,
+        leader_pm.nickname AS leader_nickname,
+        COUNT(pm.client_id)::int AS member_count
+      FROM parties p
+      JOIN party_members leader_pm
+        ON leader_pm.party_id = p.id
+       AND leader_pm.client_id = p.leader_client_id
+      JOIN party_members pm
+        ON pm.party_id = p.id
+      JOIN presence pr
+        ON pr.client_id = p.leader_client_id
+      WHERE p.visibility = 'public'
+        AND p.status = 'lobby'
+        AND pr.last_seen_ms >= $1
+      GROUP BY
+        p.id,
+        p.party_code,
+        p.mode,
+        p.visibility,
+        p.password_hash,
+        p.status,
+        p.leader_client_id,
+        leader_pm.nickname
+      HAVING COUNT(pm.client_id) < 2
+      ORDER BY p.created_at ASC
+      `,
+      [cutoff]
+    );
+
+    return res.json({
+      ok: true,
+      lobbies: q.rows.map((row) => ({
+        partyId: row.party_id,
+        partyCode: row.party_code,
+        leaderNickname: row.leader_nickname,
+        mode: row.mode,
+        visibility: row.visibility,
+        passwordProtected: !!row.password_hash,
+        memberCount: row.member_count,
+        maxMembers: 2
+      }))
+    });
+  } catch (err) {
+    console.error("party/list error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+
+app.post("/party/queue/join", async (req, res) => {
+  const clientDb = await pool.connect();
+  try {
+    const { clientId, mode } = req.body || {};
+
+    if (!clientId || !mode) {
+      return res.status(400).json({ ok: false, error: "missing_fields" });
+    }
+
+    if (mode !== "2x2") {
+      return res.status(400).json({ ok: false, error: "party_mode_not_supported" });
+    }
+
+    const membership = await getPartyMembershipByClientId(clientId);
+    if (!membership) {
+      return res.status(404).json({ ok: false, error: "party_not_found" });
+    }
+
+    if (membership.leader_client_id !== clientId) {
+      return res.status(403).json({ ok: false, error: "not_party_leader" });
+    }
+
+    const effectiveStatus = await getEffectivePartyStatus(membership.party_id, membership.status);
+    if (effectiveStatus !== "lobby") {
+      return res.status(409).json({ ok: false, error: "party_not_in_lobby" });
+    }
+
+    const members = await getPartyMembers(membership.party_id);
+    if (members.length !== 2) {
+      return res.status(409).json({ ok: false, error: "party_requires_two_players" });
+    }
+
+    for (const m of members) {
+      if (!(await isClientLinked(m.clientId))) {
+        return res.status(409).json({ ok: false, error: "party_member_not_linked" });
+      }
+    }
+
+    await clientDb.query("BEGIN");
+
+    for (const m of members) {
+      await clientDb.query(
+        `
+        INSERT INTO queue_entries (
+          client_id, nickname, mode, status, match_id, joined_at, updated_at, last_seen_ms
+        )
+        VALUES ($1, $2, $3, 'searching', NULL, NOW(), NOW(), $4)
+        ON CONFLICT (client_id)
+        DO UPDATE SET
+          nickname = EXCLUDED.nickname,
+          mode = EXCLUDED.mode,
+          status = 'searching',
+          match_id = NULL,
+          updated_at = NOW(),
+          last_seen_ms = EXCLUDED.last_seen_ms
+        `,
+        [m.clientId, m.nickname, mode, nowMs()]
+      );
+    }
+
+    await clientDb.query(
+      `
+      UPDATE parties
+      SET status = 'searching',
+          updated_at = NOW()
+      WHERE id = $1
+      `,
+      [membership.party_id]
+    );
+
+    await clientDb.query("COMMIT");
+
+    const matchId = await tryCreateMatch(mode);
+
+    if (matchId) {
+      await pool.query(
+        `
+        UPDATE parties
+        SET status = 'match_found',
+            updated_at = NOW()
+        WHERE id = $1
+        `,
+        [membership.party_id]
+      );
+    }
+
+    return res.json({
+      ok: true,
+      partyId: membership.party_id,
+      partyCode: membership.party_code,
+      status: matchId ? "match_found" : "searching"
+    });
+  } catch (err) {
+    await clientDb.query("ROLLBACK");
+    console.error("party/queue/join error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  } finally {
+    clientDb.release();
+  }
+});
+
+app.post("/party/queue/leave", async (req, res) => {
+  const clientDb = await pool.connect();
+  try {
+    const { clientId } = req.body || {};
+    if (!clientId) {
+      return res.status(400).json({ ok: false, error: "missing_client_id" });
+    }
+
+    const membership = await getPartyMembershipByClientId(clientId);
+    if (!membership) {
+      return res.status(404).json({ ok: false, error: "party_not_found" });
+    }
+
+    if (membership.leader_client_id !== clientId) {
+      return res.status(403).json({ ok: false, error: "not_party_leader" });
+    }
+
+    const effectiveStatus = await getEffectivePartyStatus(membership.party_id, membership.status);
+    if (effectiveStatus !== "searching") {
+      return res.status(409).json({ ok: false, error: "party_not_searching" });
+    }
+
+    const members = await getPartyMembers(membership.party_id);
+
+    await clientDb.query("BEGIN");
+
+    for (const m of members) {
+      await clientDb.query(
+        `
+        DELETE FROM queue_entries
+        WHERE client_id = $1
+        `,
+        [m.clientId]
+      );
+    }
+
+    await clientDb.query(
+      `
+      UPDATE parties
+      SET status = 'lobby',
+          updated_at = NOW()
+      WHERE id = $1
+      `,
+      [membership.party_id]
+    );
+
+    await clientDb.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      partyId: membership.party_id,
+      partyCode: membership.party_code,
+      status: "lobby"
+    });
+  } catch (err) {
+    await clientDb.query("ROLLBACK");
+    console.error("party/queue/leave error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  } finally {
+    clientDb.release();
+  }
+});
+
+// ------------------------ boot ------------------------
+
 async function boot() {
   try {
     await ensureSchema();
@@ -1511,6 +2257,7 @@ async function boot() {
       cleanupStaleQueueEntries().catch((err) => console.error("cleanupStaleQueueEntries:", err));
       cleanupExpiredLinkCodes().catch((err) => console.error("cleanupExpiredLinkCodes:", err));
       cleanupExpiredLauncherLinkTokens().catch((err) => console.error("cleanupExpiredLauncherLinkTokens:", err));
+      cleanupStaleParties().catch((err) => console.error("cleanupStaleParties:", err));
     }, 30000);
 
     app.listen(PORT, () => {
