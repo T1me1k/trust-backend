@@ -113,6 +113,11 @@ function newLinkCode(length = 8) {
   return out;
 }
 
+function newLauncherLinkToken() {
+  return crypto.randomBytes(24).toString("hex");
+}
+
+
 function sha256(input) {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
@@ -219,6 +224,140 @@ async function fetchSteamProfile(steamId) {
   };
 }
 
+app.post("/launcher/link/start", requireAuth, async (req, res) => {
+  try {
+    const token = newLauncherLinkToken();
+
+    await pool.query(
+      `
+      INSERT INTO launcher_link_tokens (
+        token,
+        user_id,
+        expires_at
+      )
+      VALUES ($1, $2, NOW() + INTERVAL '5 minutes')
+      `,
+      [token, req.session.userId]
+    );
+
+    return res.json({
+      ok: true,
+      token,
+      launchUrl: `trust://link?token=${encodeURIComponent(token)}`
+    });
+  } catch (err) {
+    console.error("launcher link start error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      details: err.message
+    });
+  }
+});
+
+app.post("/launcher/link/complete", async (req, res) => {
+  try {
+    const { clientId, nickname, token } = req.body || {};
+
+    if (!clientId || !token) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_fields"
+      });
+    }
+
+    const tokenResult = await pool.query(
+      `
+      SELECT *
+      FROM launcher_link_tokens
+      WHERE token = $1
+      LIMIT 1
+      `,
+      [token]
+    );
+
+    const row = tokenResult.rows[0];
+
+    if (!row) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_token"
+      });
+    }
+
+    if (row.consumed_at) {
+      return res.status(400).json({
+        ok: false,
+        error: "token_already_used"
+      });
+    }
+
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({
+        ok: false,
+        error: "token_expired"
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      await client.query(
+        `
+        INSERT INTO launcher_links (
+          user_id,
+          client_id,
+          nickname
+        )
+        VALUES ($1, $2, $3)
+        ON CONFLICT (client_id)
+        DO UPDATE SET
+          user_id = EXCLUDED.user_id,
+          nickname = EXCLUDED.nickname,
+          linked_at = NOW()
+        `,
+        [row.user_id, clientId, typeof nickname === "string" ? nickname.trim() : null]
+      );
+
+      await client.query(
+        `
+        UPDATE launcher_link_tokens
+        SET consumed_at = NOW()
+        WHERE id = $1
+        `,
+        [row.id]
+      );
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    return res.json({
+      ok: true,
+      linked: true
+    });
+  } catch (err) {
+    console.error("launcher link complete error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      details: err.message
+    });
+  }
+});
+
+async function cleanupExpiredLauncherLinkTokens() {
+  await pool.query(`
+    DELETE FROM launcher_link_tokens
+    WHERE expires_at < NOW() - INTERVAL '1 day'
+  `);
+}
+
 async function upsertUserFromSteam(profile) {
   const result = await pool.query(
     `
@@ -264,6 +403,28 @@ function requireAuth(req, res, next) {
 }
 
 async function ensureSchema() {
+
+  await pool.query(`
+  CREATE TABLE IF NOT EXISTS launcher_link_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    token TEXT NOT NULL UNIQUE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ
+  )
+`);
+
+  await pool.query(`
+  CREATE INDEX IF NOT EXISTS idx_launcher_link_tokens_token
+  ON launcher_link_tokens(token)
+`);
+
+  await pool.query(`
+  CREATE INDEX IF NOT EXISTS idx_launcher_link_tokens_user_id
+  ON launcher_link_tokens(user_id)
+`);
+
   await pool.query(`
     CREATE EXTENSION IF NOT EXISTS pgcrypto
   `);
@@ -334,7 +495,7 @@ async function ensureSchema() {
       ALTER TABLE queue_entries
       ALTER COLUMN match_id DROP NOT NULL
     `);
-  } catch (_) {}
+  } catch (_) { }
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_queue_mode_status
@@ -1352,6 +1513,11 @@ async function start() {
     console.log("Allowed CORS origins:", ALLOWED_ORIGINS);
 
     setInterval(() => {
+
+      cleanupExpiredLauncherLinkTokens().catch(err =>
+        console.error("cleanup launcher link tokens error:", err)
+      );
+
       cleanupStaleQueueEntries().catch(err => console.error("cleanup queue error:", err));
       cleanupStalePresence().catch(err => console.error("cleanup presence error:", err));
       cleanupExpiredLinkCodes().catch(err => console.error("cleanup link codes error:", err));
