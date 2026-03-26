@@ -1,12 +1,13 @@
 {
   "name": "trust-backend",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "TRUST backend for Steam auth, parties, queue, matches and leaderboard",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js"
   },
   "dependencies": {
+    "connect-pg-simple": "^10.0.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
