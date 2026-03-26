@@ -10,14 +10,16 @@ router.get('/me', requireAuth, async (req, res) => {
   return ok(res, {
     user: {
       id: account.id,
+      steamId: account.steam_id,
       steamId64: account.steam_id,
       nickname: account.persona_name,
-      avatarUrl: account.avatar_full_url,
-      elo2v2: account.elo_2v2,
-      wins2v2: account.wins_2v2,
-      losses2v2: account.losses_2v2,
-      matchesPlayed2v2: account.matches_played_2v2,
-      presence: account.presence
+      avatarUrl: account.avatar_full_url || account.avatar_medium_url || account.avatar_url || null,
+      profileUrl: account.profile_url || null,
+      elo2v2: Number(account.elo_2v2 || 100),
+      wins2v2: Number(account.wins_2v2 || 0),
+      losses2v2: Number(account.losses_2v2 || 0),
+      matchesPlayed2v2: Number(account.matches_played_2v2 || 0),
+      presence: account.presence || 'online'
     }
   });
 });
@@ -31,10 +33,10 @@ router.get('/me/stats', requireAuth, async (req, res) => {
   const account = await getAccountByUserId(req.session.userId);
   return ok(res, {
     stats: {
-      elo2v2: account.elo_2v2,
-      wins2v2: account.wins_2v2,
-      losses2v2: account.losses_2v2,
-      matchesPlayed2v2: account.matches_played_2v2
+      elo2v2: Number(account.elo_2v2 || 100),
+      wins2v2: Number(account.wins_2v2 || 0),
+      losses2v2: Number(account.losses_2v2 || 0),
+      matchesPlayed2v2: Number(account.matches_played_2v2 || 0)
     }
   });
 });
@@ -43,7 +45,16 @@ router.get('/users/search', requireAuth, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return fail(res, 400, 'missing_query');
   const items = await searchUsersByNickname(q);
-  return ok(res, { items });
+  return ok(res, {
+    items: items.map((item) => ({
+      id: item.id,
+      steamId: item.steam_id,
+      steamId64: item.steam_id,
+      nickname: item.persona_name,
+      avatarUrl: item.avatar_full_url || null,
+      elo2v2: Number(item.elo_2v2 || 100)
+    }))
+  });
 });
 
 module.exports = router;

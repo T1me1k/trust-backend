@@ -15,7 +15,7 @@ const router = express.Router();
 
 router.get('/me', async (req, res) => {
   try {
-    if (!req.session.userId) return ok(res, { user: null });
+    if (!req.session?.userId) return ok(res, { user: null });
 
     const account = await getAccountByUserId(req.session.userId);
     if (!account) return ok(res, { user: null });
@@ -23,9 +23,11 @@ router.get('/me', async (req, res) => {
     return ok(res, {
       user: {
         id: account.id,
-        steamId: account.steam_id64 || null,
-        nickname: account.steam_persona_name || null,
-        avatarUrl: account.avatar_url || null,
+        steamId: account.steam_id || null,
+        steamId64: account.steam_id || null,
+        nickname: account.persona_name || null,
+        avatarUrl: account.avatar_full_url || account.avatar_medium_url || account.avatar_url || null,
+        profileUrl: account.profile_url || null,
         elo2v2: Number(account.elo_2v2 || 100),
         wins2v2: Number(account.wins_2v2 || 0),
         losses2v2: Number(account.losses_2v2 || 0),

@@ -90,38 +90,43 @@ async function fetchSteamProfile(steamId) {
 }
 
 async function upsertUserFromSteam(profile) {
-  const steamId64 = String(profile?.steamid || '').trim();
-  if (!steamId64) {
+  const steamId = String(profile?.steamid || '').trim();
+  if (!steamId) {
     throw new Error('Steam profile is missing steamid');
   }
 
-  const nickname = String(profile?.personaname || `Steam_${steamId64}`).trim();
-  const avatarUrl =
-    profile?.avatarfull ||
-    profile?.avatarmedium ||
-    profile?.avatar ||
-    null;
+  const personaName = String(profile?.personaname || `Steam_${steamId}`).trim();
+  const profileUrl = profile?.profileurl || `https://steamcommunity.com/profiles/${steamId}`;
+  const avatarUrl = profile?.avatar || null;
+  const avatarMediumUrl = profile?.avatarmedium || null;
+  const avatarFullUrl = profile?.avatarfull || profile?.avatarmedium || profile?.avatar || null;
 
   const result = await query(
     `
     INSERT INTO users (
-      steam_id64,
-      steam_persona_name,
+      steam_id,
+      persona_name,
+      profile_url,
       avatar_url,
+      avatar_medium_url,
+      avatar_full_url,
       created_at,
       updated_at,
       last_login_at
     )
-    VALUES ($1, $2, $3, NOW(), NOW(), NOW())
-    ON CONFLICT (steam_id64)
+    VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), NOW())
+    ON CONFLICT (steam_id)
     DO UPDATE SET
-      steam_persona_name = EXCLUDED.steam_persona_name,
+      persona_name = EXCLUDED.persona_name,
+      profile_url = EXCLUDED.profile_url,
       avatar_url = EXCLUDED.avatar_url,
+      avatar_medium_url = EXCLUDED.avatar_medium_url,
+      avatar_full_url = EXCLUDED.avatar_full_url,
       updated_at = NOW(),
       last_login_at = NOW()
     RETURNING *
     `,
-    [steamId64, nickname, avatarUrl]
+    [steamId, personaName, profileUrl, avatarUrl, avatarMediumUrl, avatarFullUrl]
   );
 
   return result.rows[0];

@@ -42,9 +42,12 @@ async function getAccountByUserId(userId) {
   const result = await query(
     `SELECT
         u.id,
-        u.steam_id64,
-        u.steam_persona_name,
+        u.steam_id,
+        u.persona_name,
+        u.profile_url,
         u.avatar_url,
+        u.avatar_medium_url,
+        u.avatar_full_url,
         p.elo_2v2,
         p.wins_2v2,
         p.losses_2v2,
@@ -67,15 +70,15 @@ async function searchUsersByNickname(q) {
   const result = await query(
     `SELECT
         u.id,
-        u.steam_id64,
-        u.steam_persona_name,
-        u.avatar_url,
+        u.steam_id,
+        u.persona_name,
+        u.avatar_full_url,
         COALESCE(p.elo_2v2, 100) AS elo_2v2
      FROM users u
      LEFT JOIN player_profiles p
        ON p.user_id = u.id
-     WHERE LOWER(u.steam_persona_name) LIKE LOWER($1)
-     ORDER BY u.steam_persona_name ASC
+     WHERE LOWER(u.persona_name) LIKE LOWER($1)
+     ORDER BY u.persona_name ASC
      LIMIT 10`,
     [`%${q}%`]
   );
