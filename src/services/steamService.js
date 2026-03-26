@@ -20,14 +20,19 @@ function buildSteamLoginUrl(returnTo) {
     'openid.identity': `${STEAM_OPENID_NS}/identifier_select`,
     'openid.claimed_id': `${STEAM_OPENID_NS}/identifier_select`
   });
+
   return `${STEAM_OPENID_ENDPOINT}?${params.toString()}`;
 }
 
 async function verifySteamOpenId(queryParams) {
   const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(queryParams)) {
-    if (typeof value === 'string') params.set(key, value);
+
+  for (const [key, value] of Object.entries(queryParams || {})) {
+    if (typeof value === 'string') {
+      params.set(key, value);
+    }
   }
+
   params.set('openid.mode', 'check_authentication');
 
   const response = await fetch(STEAM_OPENID_ENDPOINT, {
@@ -37,11 +42,16 @@ async function verifySteamOpenId(queryParams) {
   });
 
   const text = await response.text();
-  if (!text.includes('is_valid:true')) throw new Error('Steam OpenID verification failed');
+  if (!text.includes('is_valid:true')) {
+    throw new Error('Steam OpenID verification failed');
+  }
 
   const claimedId = queryParams['openid.claimed_id'] || queryParams['openid.identity'];
   const match = claimedId && claimedId.match(CLAIMED_ID_REGEX);
-  if (!match) throw new Error('Invalid Steam claimed_id');
+  if (!match) {
+    throw new Error('Invalid Steam claimed_id');
+  }
+
   return match[1];
 }
 
@@ -62,7 +72,10 @@ async function fetchSteamProfile(steamId) {
   url.searchParams.set('steamids', steamId);
 
   const response = await fetch(url.toString());
-  if (!response.ok) throw new Error(`Steam profile fetch failed: ${response.status}`);
+  if (!response.ok) {
+    throw new Error(`Steam profile fetch failed: ${response.status}`);
+  }
+
   const data = await response.json();
   const player = data?.response?.players?.[0] || {};
 
@@ -77,31 +90,40 @@ async function fetchSteamProfile(steamId) {
 }
 
 async function upsertUserFromSteam(profile) {
+  const steamId64 = String(profile?.steamid || '').trim();
+  if (!steamId64) {
+    throw new Error('Steam profile is missing steamid');
+  }
+
+  const nickname = String(profile?.personaname || `Steam_${steamId64}`).trim();
+  const avatarUrl =
+    profile?.avatarfull ||
+    profile?.avatarmedium ||
+    profile?.avatar ||
+    null;
+
   const result = await query(
     `
     INSERT INTO users (
-      steam_id, persona_name, profile_url, avatar_url, avatar_medium_url, avatar_full_url, created_at, updated_at, last_login_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW(),NOW())
-    ON CONFLICT (steam_id)
+      steam_id64,
+      steam_persona_name,
+      avatar_url,
+      created_at,
+      updated_at,
+      last_login_at
+    )
+    VALUES ($1, $2, $3, NOW(), NOW(), NOW())
+    ON CONFLICT (steam_id64)
     DO UPDATE SET
-      persona_name = EXCLUDED.persona_name,
-      profile_url = EXCLUDED.profile_url,
+      steam_persona_name = EXCLUDED.steam_persona_name,
       avatar_url = EXCLUDED.avatar_url,
-      avatar_medium_url = EXCLUDED.avatar_medium_url,
-      avatar_full_url = EXCLUDED.avatar_full_url,
       updated_at = NOW(),
       last_login_at = NOW()
     RETURNING *
     `,
-    [
-      profile.steamid,
-      profile.personaname,
-      profile.profileurl,
-      profile.avatar,
-      profile.avatarmedium,
-      profile.avatarfull
-    ]
+    [steamId64, nickname, avatarUrl]
   );
+
   return result.rows[0];
 }
 
@@ -112,7 +134,11 @@ function createSteamLoginState(req) {
 }
 
 function validateSteamLoginState(req, raw) {
-  return !!(raw && req.session?.steamLoginState && sha256(raw) === req.session.steamLoginState);
+  return !!(
+    raw &&
+    req.session?.steamLoginState &&
+    sha256(raw) === req.session.steamLoginState
+  );
 }
 
 module.exports = {
