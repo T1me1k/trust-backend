@@ -14,22 +14,29 @@ const config = require('../config');
 const router = express.Router();
 
 router.get('/me', async (req, res) => {
-  if (!req.session.userId) return ok(res, { user: null });
-  const account = await getAccountByUserId(req.session.userId);
-  return ok(res, {
-    user: account ? {
-      id: account.id,
-      steamId: account.steam_id,
-      nickname: account.persona_name,
-      avatarUrl: account.avatar_full_url,
-      profileUrl: account.profile_url,
-      elo2v2: account.elo_2v2,
-      wins2v2: account.wins_2v2,
-      losses2v2: account.losses_2v2,
-      matchesPlayed2v2: account.matches_played_2v2,
-      presence: account.presence
-    } : null
-  });
+  try {
+    if (!req.session.userId) return ok(res, { user: null });
+
+    const account = await getAccountByUserId(req.session.userId);
+    if (!account) return ok(res, { user: null });
+
+    return ok(res, {
+      user: {
+        id: account.id,
+        steamId: account.steam_id64 || null,
+        nickname: account.steam_persona_name || null,
+        avatarUrl: account.avatar_url || null,
+        elo2v2: Number(account.elo_2v2 || 100),
+        wins2v2: Number(account.wins_2v2 || 0),
+        losses2v2: Number(account.losses_2v2 || 0),
+        matchesPlayed2v2: Number(account.matches_played_2v2 || 0),
+        presence: account.presence || 'online'
+      }
+    });
+  } catch (err) {
+    console.error('auth /me error:', err);
+    return fail(res, 500, 'auth_me_failed');
+  }
 });
 
 router.get('/steam', (req, res) => {
