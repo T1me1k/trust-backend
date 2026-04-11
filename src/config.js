@@ -1,6 +1,6 @@
 const parseBool = (v, d = false) => {
   if (v === undefined || v === null || v === '') return d;
-  return String(v).toLowerCase() === 'true';
+  return ['1', 'true', 'yes', 'on'].includes(String(v).toLowerCase());
 };
 
 function toOrigin(value) {
@@ -12,11 +12,22 @@ function toOrigin(value) {
   }
 }
 
+function splitCsv(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+const publicSiteUrl = process.env.PUBLIC_SITE_URL || '';
+const siteOrigin = process.env.SITE_ORIGIN || publicSiteUrl || '';
+const extraAllowedOrigins = splitCsv(process.env.ALLOWED_ORIGINS);
+
 module.exports = {
   port: Number(process.env.PORT || 3000),
   backendBaseUrl: process.env.BACKEND_BASE_URL || '',
-  publicSiteUrl: process.env.PUBLIC_SITE_URL || '',
-  siteOrigin: process.env.SITE_ORIGIN || process.env.PUBLIC_SITE_URL || '',
+  publicSiteUrl,
+  siteOrigin,
   sessionSecret: process.env.SESSION_SECRET || 'change_me',
   steamApiKey: process.env.STEAM_API_KEY || '',
   cookieSecure: parseBool(process.env.COOKIE_SECURE, true),
@@ -27,7 +38,15 @@ module.exports = {
   defaultServerPassword: process.env.DEFAULT_SERVER_PASSWORD || 'trust',
   matchmakingIntervalMs: Number(process.env.MATCHMAKING_INTERVAL_MS || 3000),
   allowedOrigins: Array.from(new Set([
-    process.env.SITE_ORIGIN || process.env.PUBLIC_SITE_URL || '',
-    process.env.PUBLIC_SITE_URL || ''
+    siteOrigin,
+    publicSiteUrl,
+    process.env.BACKEND_BASE_URL || '',
+    ...extraAllowedOrigins,
+    'http://127.0.0.1:5500',
+    'http://localhost:5500',
+    'http://127.0.0.1:5173',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://localhost:3000'
   ].map(toOrigin).filter(Boolean)))
 };
