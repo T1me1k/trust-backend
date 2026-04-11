@@ -11,6 +11,10 @@ function sha256(input) {
   return crypto.createHash('sha256').update(String(input || '')).digest('hex');
 }
 
+function signStatePayload(payload) {
+  return crypto.createHmac('sha256', config.sessionSecret).update(String(payload)).digest('hex');
+}
+
 function buildSteamLoginUrl(returnTo) {
   const params = new URLSearchParams({
     'openid.ns': STEAM_OPENID_NS,
@@ -132,18 +136,29 @@ async function upsertUserFromSteam(profile) {
   return result.rows[0];
 }
 
-function createSteamLoginState(req) {
-  const raw = crypto.randomBytes(24).toString('hex');
-  req.session.steamLoginState = sha256(raw);
-  return raw;
+function createSteamLoginState() {
+  const payload = JSON.stringify({
+    nonce: crypto.randomBytes(16).toString('hex'),
+    ts: Date.now()
+  });
+  const encoded = Buffer.from(payload).toString('base64url');
+  const signature = signStatePayload(encoded);
+  return `${encoded}.${signature}`;
 }
 
 function validateSteamLoginState(req, raw) {
-  return !!(
-    raw &&
-    req.session?.steamLoginState &&
-    sha256(raw) === req.session.steamLoginState
-  );
+  if (!raw || typeof raw !== 'string') return false;
+  const [encoded, signature] = raw.split('.');
+  if (!encoded || !signature) return false;
+  if (signature !== signStatePayload(encoded)) return false;
+
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    const ageMs = Date.now() - Number(payload.ts || 0);
+    return ageMs >= 0 && ageMs <= 10 * 60 * 1000;
+  } catch (_) {
+    return false;
+  }
 }
 
 module.exports = {

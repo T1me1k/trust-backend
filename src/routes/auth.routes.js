@@ -1,5 +1,7 @@
 const express = require('express');
 const { ok, fail } = require('../utils/http');
+const { createAuthToken } = require('../utils/authToken');
+const { getAuthenticatedUserId } = require('../middleware/auth');
 const { ensurePlayerProfile, setPresence, getAccountByUserId } = require('../services/accountService');
 const {
   buildSteamLoginUrl,
@@ -15,9 +17,10 @@ const router = express.Router();
 
 router.get('/me', async (req, res) => {
   try {
-    if (!req.session?.userId) return ok(res, { user: null });
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) return ok(res, { user: null });
 
-    const account = await getAccountByUserId(req.session.userId);
+    const account = await getAccountByUserId(userId);
     if (!account) return ok(res, { user: null });
 
     return ok(res, {
@@ -44,17 +47,11 @@ router.get('/me', async (req, res) => {
 router.get('/steam', (req, res) => {
   if (!config.backendBaseUrl) return fail(res, 500, 'backend_base_url_missing');
 
-  const state = createSteamLoginState(req);
+  const state = createSteamLoginState();
   const returnTo = `${config.backendBaseUrl.replace(/\/+$/, '')}/auth/steam/callback?state=${encodeURIComponent(state)}`;
   const loginUrl = buildSteamLoginUrl(returnTo);
 
-  req.session.save((err) => {
-    if (err) {
-      console.error('session save before steam redirect failed:', err);
-      return fail(res, 500, 'session_save_failed');
-    }
-    return res.redirect(loginUrl);
-  });
+  return res.redirect(loginUrl);
 });
 
 router.get('/steam/callback', async (req, res) => {
@@ -69,17 +66,16 @@ router.get('/steam/callback', async (req, res) => {
     const user = await upsertUserFromSteam(profile);
 
     req.session.userId = user.id;
-    delete req.session.steamLoginState;
-
     await ensurePlayerProfile(user.id);
     await setPresence(user.id, 'online', null, null);
+
+    const authToken = createAuthToken(user.id);
 
     req.session.save((err) => {
       if (err) {
         console.error('session save after steam callback failed:', err);
-        return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/?auth_error=session_save_failed`);
       }
-      return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/app.html`);
+      return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/app.html#auth_token=${encodeURIComponent(authToken)}`);
     });
   } catch (err) {
     console.error('steam callback error:', err);

@@ -6,7 +6,7 @@ const { getAccountByUserId, getHistoryByUserId, searchUsersByNickname } = requir
 const router = express.Router();
 
 router.get('/me', requireAuth, async (req, res) => {
-  const account = await getAccountByUserId(req.session.userId);
+  const account = await getAccountByUserId(req.authUserId || req.session.userId);
   return ok(res, {
     user: {
       id: account.id,
@@ -25,12 +25,12 @@ router.get('/me', requireAuth, async (req, res) => {
 });
 
 router.get('/me/history', requireAuth, async (req, res) => {
-  const items = await getHistoryByUserId(req.session.userId, Number(req.query.limit || 8));
+  const items = await getHistoryByUserId(req.authUserId || req.session.userId, Number(req.query.limit || 8));
   return ok(res, { items });
 });
 
 router.get('/me/stats', requireAuth, async (req, res) => {
-  const account = await getAccountByUserId(req.session.userId);
+  const account = await getAccountByUserId(req.authUserId || req.session.userId);
   return ok(res, {
     stats: {
       elo2v2: Number(account.elo_2v2 || 100),

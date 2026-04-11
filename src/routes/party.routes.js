@@ -16,12 +16,12 @@ const router = express.Router();
 router.use(requireAuth);
 
 router.post('/create', async (req, res) => {
-  const party = await createParty(req.session.userId);
+  const party = await createParty(req.authUserId || req.session.userId);
   return ok(res, { party });
 });
 
 router.get('/me', async (req, res) => {
-  const party = await getCurrentPartyByUserId(req.session.userId);
+  const party = await getCurrentPartyByUserId(req.authUserId || req.session.userId);
   return ok(res, { party });
 });
 
@@ -29,7 +29,7 @@ router.post('/invite', async (req, res) => {
   try {
     const targetUserId = req.body.targetUserId;
     if (!targetUserId) return fail(res, 400, 'missing_target_user_id');
-    const invite = await inviteToParty({ actorUserId: req.session.userId, targetUserId });
+    const invite = await inviteToParty({ actorUserId: req.authUserId || req.session.userId, targetUserId });
     return ok(res, { invite });
   } catch (err) {
     return fail(res, 400, err.message || 'party_invite_failed');
@@ -38,8 +38,8 @@ router.post('/invite', async (req, res) => {
 
 router.post('/invite/:id/accept', async (req, res) => {
   try {
-    const partyId = await acceptInvite(req.params.id, req.session.userId);
-    await setPresence(req.session.userId, 'in_party', partyId, null);
+    const partyId = await acceptInvite(req.params.id, req.authUserId || req.session.userId);
+    await setPresence(req.authUserId || req.session.userId, 'in_party', partyId, null);
     return ok(res, { accepted: true });
   } catch (err) {
     return fail(res, 400, err.message || 'accept_failed');
@@ -47,14 +47,14 @@ router.post('/invite/:id/accept', async (req, res) => {
 });
 
 router.post('/invite/:id/decline', async (req, res) => {
-  const changed = await declineInvite(req.params.id, req.session.userId);
+  const changed = await declineInvite(req.params.id, req.authUserId || req.session.userId);
   if (!changed) return fail(res, 404, 'invite_not_found');
   return ok(res, { declined: true });
 });
 
 router.post('/leave', async (req, res) => {
   try {
-    await leaveParty(req.session.userId);
+    await leaveParty(req.authUserId || req.session.userId);
     return ok(res, { left: true });
   } catch (err) {
     return fail(res, 400, err.message || 'leave_failed');
@@ -63,7 +63,7 @@ router.post('/leave', async (req, res) => {
 
 router.post('/disband', async (req, res) => {
   try {
-    await disbandParty(req.session.userId);
+    await disbandParty(req.authUserId || req.session.userId);
     return ok(res, { disbanded: true });
   } catch (err) {
     return fail(res, 400, err.message || 'disband_failed');

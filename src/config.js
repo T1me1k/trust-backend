@@ -28,6 +28,8 @@ module.exports = {
   matchmakingIntervalMs: Number(process.env.MATCHMAKING_INTERVAL_MS || 3000),
   allowedOrigins: Array.from(new Set([
     process.env.SITE_ORIGIN || process.env.PUBLIC_SITE_URL || '',
-    process.env.PUBLIC_SITE_URL || ''
-  ].map(toOrigin).filter(Boolean)))
+    process.env.PUBLIC_SITE_URL || '',
+    ...(process.env.ALLOWED_ORIGINS || '').split(',')
+  ].map(toOrigin).filter(Boolean))),
+  authTokenTtlDays: Number(process.env.AUTH_TOKEN_TTL_DAYS || 30)
 };

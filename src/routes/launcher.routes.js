@@ -20,7 +20,7 @@ router.post('/link/consume', requireAuth, async (req, res) => {
   try {
     const { code } = req.body || {};
     if (!code) return fail(res, 400, 'missing_code');
-    const link = await consumeLauncherLinkCode({ code, userId: req.session.userId });
+    const link = await consumeLauncherLinkCode({ code, userId: req.authUserId || req.session.userId });
     return ok(res, { link });
   } catch (err) {
     return fail(res, 400, err.message || 'link_consume_failed');
