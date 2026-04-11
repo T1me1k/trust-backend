@@ -13,12 +13,6 @@ const config = require('../config');
 
 const router = express.Router();
 
-function getSiteRedirectUrl(pathname = '/') {
-  const site = (config.publicSiteUrl || config.siteOrigin || '').replace(/\/+$/, '');
-  if (!site) return pathname;
-  return `${site}${pathname}`;
-}
-
 router.get('/me', async (req, res) => {
   try {
     if (!req.session?.userId) return ok(res, { user: null });
@@ -49,7 +43,6 @@ router.get('/me', async (req, res) => {
 
 router.get('/steam', (req, res) => {
   if (!config.backendBaseUrl) return fail(res, 500, 'backend_base_url_missing');
-  if (!config.publicSiteUrl && !config.siteOrigin) return fail(res, 500, 'public_site_url_missing');
 
   const state = createSteamLoginState(req);
   const returnTo = `${config.backendBaseUrl.replace(/\/+$/, '')}/auth/steam/callback?state=${encodeURIComponent(state)}`;
@@ -68,7 +61,7 @@ router.get('/steam/callback', async (req, res) => {
   try {
     const state = typeof req.query.state === 'string' ? req.query.state : '';
     if (!validateSteamLoginState(req, state)) {
-      return res.redirect(getSiteRedirectUrl('/?auth_error=invalid_state'));
+      return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/?auth_error=invalid_state`);
     }
 
     const steamId = await verifySteamOpenId(req.query);
@@ -84,13 +77,13 @@ router.get('/steam/callback', async (req, res) => {
     req.session.save((err) => {
       if (err) {
         console.error('session save after steam callback failed:', err);
-        return res.redirect(getSiteRedirectUrl('/?auth_error=session_save_failed'));
+        return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/?auth_error=session_save_failed`);
       }
-      return res.redirect(getSiteRedirectUrl('/app.html'));
+      return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/app.html`);
     });
   } catch (err) {
     console.error('steam callback error:', err);
-    return res.redirect(getSiteRedirectUrl('/?auth_error=1'));
+    return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/?auth_error=1`);
   }
 });
 
