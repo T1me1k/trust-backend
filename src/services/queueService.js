@@ -30,47 +30,38 @@ async function getQueueState(userId) {
      LIMIT 1`,
     [userId]
   );
-
   return normalizeQueueRow(result.rows[0] || null);
 }
 
 async function getPartyForQueue(userId) {
   let party = await getCurrentPartyByUserId(userId);
-  if (!party || !party.id) {
-    party = await createParty(userId);
-  }
+  if (!party?.id) party = await createParty(userId);
   return party;
 }
 
-async function joinQueue(userId, _mode = '2x2') {
+async function joinQueue(userId) {
   const party = await getPartyForQueue(userId);
-  if (!party || !party.id) throw new Error('party_not_found');
+  if (!party?.id) throw new Error('party_not_found');
   if (party.leader_user_id !== userId) throw new Error('not_party_leader');
   if (party.status !== 'open') throw new Error('party_not_open');
-
   const memberCount = party.members.length;
   if (memberCount < 1 || memberCount > 2) throw new Error('party_size_invalid');
-
-  const mode = '2x2';
 
   await withTransaction(async (client) => {
     await client.query(
       `INSERT INTO queue_entries (party_id, leader_user_id, mode, status, queued_at)
-       VALUES ($1, $2, $3, 'queued', NOW())
+       VALUES ($1, $2, '2x2', 'queued', NOW())
        ON CONFLICT (party_id)
        DO UPDATE SET leader_user_id = EXCLUDED.leader_user_id,
                      mode = EXCLUDED.mode,
                      status = 'queued',
                      queued_at = NOW(),
                      matched_at = NULL`,
-      [party.id, userId, '2x2']
+      [party.id, userId]
     );
-
     await client.query(
-      `UPDATE parties
-       SET status = 'searching', queue_mode = $2, updated_at = NOW()
-       WHERE id = $1`,
-      [party.id, '2x2']
+      `UPDATE parties SET status = 'searching', queue_mode = '2x2', updated_at = NOW() WHERE id = $1`,
+      [party.id]
     );
   });
 
@@ -83,37 +74,21 @@ async function joinQueue(userId, _mode = '2x2') {
 
 async function cancelQueue(userId) {
   const party = await getCurrentPartyByUserId(userId);
-  if (!party || !party.id) throw new Error('party_not_found');
+  if (!party?.id) throw new Error('party_not_found');
   if (party.leader_user_id !== userId) throw new Error('not_party_leader');
 
-  await query(
-    `UPDATE queue_entries
-     SET status = 'cancelled'
-     WHERE party_id = $1 AND status = 'queued'`,
-    [party.id]
-  );
-
-  await query(
-    `UPDATE parties
-     SET status = 'open', updated_at = NOW()
-     WHERE id = $1`,
-    [party.id]
-  );
+  await query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status = 'queued'`, [party.id]);
+  await query(`UPDATE parties SET status = 'open', updated_at = NOW() WHERE id = $1`, [party.id]);
 
   for (const member of party.members) {
     await setPresence(member.userId, 'in_party', party.id, null);
   }
-
   return true;
 }
 
 async function ensureDefaultServer() {
   const result = await query(
-    `SELECT *
-     FROM server_instances
-     WHERE status = 'idle'
-     ORDER BY last_heartbeat_at DESC NULLS LAST, name ASC
-     LIMIT 1`
+    `SELECT * FROM server_instances WHERE status = 'idle' ORDER BY last_heartbeat_at DESC NULLS LAST, name ASC LIMIT 1`
   );
   if (result.rows[0]) return result.rows[0];
 
@@ -133,21 +108,12 @@ async function loadQueuedEntries() {
      FROM queue_entries qe
      JOIN parties p ON p.id = qe.party_id
      JOIN party_members pm ON pm.party_id = qe.party_id
-     WHERE qe.status = 'queued'
-       AND qe.mode = '2x2'
-       AND p.status = 'searching'
+     WHERE qe.status = 'queued' AND qe.mode = '2x2' AND p.status = 'searching'
      GROUP BY qe.party_id, qe.leader_user_id, qe.mode, qe.queued_at
      HAVING COUNT(pm.user_id) BETWEEN 1 AND 2
      ORDER BY qe.queued_at ASC, qe.party_id ASC`
   );
-
-  return result.rows.map((row) => ({
-    party_id: row.party_id,
-    leader_user_id: row.leader_user_id,
-    mode: row.mode,
-    queued_at: row.queued_at,
-    member_count: Number(row.member_count)
-  }));
+  return result.rows.map((row) => ({ ...row, member_count: Number(row.member_count) }));
 }
 
 async function loadPartyMembers(partyId) {
@@ -181,8 +147,7 @@ function pickEntriesFor2x2(entries) {
       return;
     }
     if (total > 4 || index >= entries.length) return;
-
-    const remainingPlayers = entries.slice(index).reduce((sum, entry) => sum + entry.member_count, 0);
+    const remainingPlayers = entries.slice(index).reduce((sum, e) => sum + e.member_count, 0);
     if (total + remainingPlayers < 4) return;
 
     const entry = entries[index];
@@ -197,21 +162,13 @@ function pickEntriesFor2x2(entries) {
 }
 
 function assignTeams(selectedEntries) {
-  const sorted = [...selectedEntries].sort((a, b) => {
-    const diff = new Date(a.queued_at).getTime() - new Date(b.queued_at).getTime();
-    return diff || String(a.party_id).localeCompare(String(b.party_id));
-  });
-
+  const sorted = [...selectedEntries].sort((a, b) => new Date(a.queued_at) - new Date(b.queued_at) || String(a.party_id).localeCompare(String(b.party_id)));
   const duoEntries = sorted.filter((entry) => entry.member_count === 2);
   const soloEntries = sorted.filter((entry) => entry.member_count === 1);
 
   if (duoEntries.length === 2) {
-    return [
-      { team: 'A', partyId: duoEntries[0].party_id },
-      { team: 'B', partyId: duoEntries[1].party_id }
-    ];
+    return [{ team: 'A', partyId: duoEntries[0].party_id }, { team: 'B', partyId: duoEntries[1].party_id }];
   }
-
   if (duoEntries.length === 1 && soloEntries.length === 2) {
     return [
       { team: 'A', partyId: duoEntries[0].party_id },
@@ -219,7 +176,6 @@ function assignTeams(selectedEntries) {
       { team: 'B', partyId: soloEntries[1].party_id }
     ];
   }
-
   if (duoEntries.length === 0 && soloEntries.length === 4) {
     return [
       { team: 'A', partyId: soloEntries[0].party_id },
@@ -228,7 +184,6 @@ function assignTeams(selectedEntries) {
       { team: 'B', partyId: soloEntries[3].party_id }
     ];
   }
-
   return null;
 }
 
@@ -247,7 +202,6 @@ async function createMatchFromSelection(selectedEntries) {
     acc[group.team] = (acc[group.team] || 0) + group.members.length;
     return acc;
   }, {});
-
   if (teamCounts.A !== 2 || teamCounts.B !== 2) return null;
 
   const server = await ensureDefaultServer();
@@ -255,24 +209,17 @@ async function createMatchFromSelection(selectedEntries) {
   const partyIds = grouped.map((group) => group.partyId);
 
   const match = await withTransaction(async (client) => {
-    await client.query(
-      `UPDATE server_instances
-       SET status = 'reserved', last_heartbeat_at = NOW()
-       WHERE id = $1`,
-      [server.id]
-    );
-
+    await client.query(`UPDATE server_instances SET status = 'reserved', last_heartbeat_at = NOW() WHERE id = $1`, [server.id]);
     const matchResult = await client.query(
       `INSERT INTO matches (public_match_id, mode, status, server_id, server_ip, server_port, server_password, map_name, created_at)
-       VALUES ($1, '2x2', 'server_assigned', $2, $3, $4, $5, 'de_dust2', NOW())
+       VALUES ($1, '2x2', 'pending_acceptance', $2, $3, $4, $5, NULL, NOW())
        RETURNING *`,
       [publicMatchId, server.id, server.host, server.port, server.server_password]
     );
-
     const row = matchResult.rows[0];
+
     let slotA = 0;
     let slotB = 0;
-
     for (const group of grouped) {
       for (const member of group.members) {
         const slotIndex = group.team === 'A' ? slotA++ : slotB++;
@@ -285,18 +232,8 @@ async function createMatchFromSelection(selectedEntries) {
     }
 
     for (const partyId of partyIds) {
-      await client.query(
-        `UPDATE queue_entries
-         SET status = 'matched', matched_at = NOW()
-         WHERE party_id = $1`,
-        [partyId]
-      );
-      await client.query(
-        `UPDATE parties
-         SET status = 'in_match', updated_at = NOW()
-         WHERE id = $1`,
-        [partyId]
-      );
+      await client.query(`UPDATE queue_entries SET status = 'matched', matched_at = NOW() WHERE party_id = $1`, [partyId]);
+      await client.query(`UPDATE parties SET status = 'in_match', updated_at = NOW() WHERE id = $1`, [partyId]);
     }
 
     return row;
@@ -314,16 +251,9 @@ async function createMatchFromSelection(selectedEntries) {
 async function runMatchmakingCycle() {
   const entries = await loadQueuedEntries();
   if (entries.length < 2) return null;
-
   const selectedEntries = pickEntriesFor2x2(entries);
   if (!selectedEntries) return null;
-
   return createMatchFromSelection(selectedEntries);
 }
 
-module.exports = {
-  getQueueState,
-  joinQueue,
-  cancelQueue,
-  runMatchmakingCycle
-};
+module.exports = { getQueueState, joinQueue, cancelQueue, runMatchmakingCycle };

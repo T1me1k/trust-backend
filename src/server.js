@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const session = require('express-session');
 const cookieParser = require('cookie-parser');
-const PgSession = require('connect-pg-simple')(session);
+const pgSession = require('connect-pg-simple')(session);
 
 const config = require('./config');
 const { pool } = require('./db');
@@ -40,47 +40,42 @@ function getAllowedOrigins() {
 
 function setupCoreMiddleware() {
   const allowedOrigins = getAllowedOrigins();
+  const cookieSecure = String(process.env.COOKIE_SECURE || config.cookieSecure || 'true') === 'true';
 
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
 
-  app.use(
-    cors({
-      origin(origin, callback) {
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.length === 0) return callback(null, true);
-        if (allowedOrigins.includes(origin)) return callback(null, true);
-        return callback(new Error(`CORS blocked for origin: ${origin}`));
-      },
-      credentials: true
-    })
-  );
+  app.use(cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
+      if (!allowedOrigins.length || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    credentials: true
+  }));
 
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));
   app.use(cookieParser());
 
-  app.use(
-    session({
-      store: new PgSession({
-        pool,
-        tableName: 'user_sessions',
-        createTableIfMissing: true
-      }),
-      name: 'trust.sid',
-      secret: process.env.SESSION_SECRET || config.sessionSecret || 'change-me',
-      resave: false,
-      saveUninitialized: false,
-      rolling: true,
-      proxy: true,
-      cookie: {
-        httpOnly: true,
-        secure: String(process.env.COOKIE_SECURE ?? config.cookieSecure ?? 'true') === 'true',
-        sameSite: 'none',
-        maxAge: 1000 * 60 * 60 * 24 * 30
-      }
-    })
-  );
+  app.use(session({
+    store: new pgSession({
+      pool,
+      tableName: 'user_sessions',
+      createTableIfMissing: true
+    }),
+    name: 'trust.sid',
+    secret: process.env.SESSION_SECRET || config.sessionSecret || 'change-me',
+    resave: false,
+    saveUninitialized: false,
+    rolling: true,
+    cookie: {
+      httpOnly: true,
+      secure: cookieSecure,
+      sameSite: cookieSecure ? 'none' : 'lax',
+      maxAge: 1000 * 60 * 60 * 24 * 30
+    }
+  }));
 }
 
 function setupRoutes() {
@@ -99,35 +94,28 @@ function setupRoutes() {
       config: {
         appName: 'TRUST',
         latestVersion: '2.1.0',
-        mode: '2x2',
+        mode: process.env.DEFAULT_MATCH_MODE || config.defaultMatchMode || '2x2',
         region: process.env.DEFAULT_REGION || config.defaultRegion || 'EU',
         matchmakingEnabled: true,
-        queueModel: 'solo_duo_2x2'
+        mapPool: ['shortdust', 'lake', 'overpass', 'vertigo', 'nuke']
       }
     });
   });
 
   app.use('/auth', authRoutes);
   app.use('/api/auth', authRoutes);
-
   app.use('/account', accountRoutes);
   app.use('/api/account', accountRoutes);
-
   app.use('/party', partyRoutes);
   app.use('/api/party', partyRoutes);
-
   app.use('/queue', queueRoutes);
   app.use('/api/queue', queueRoutes);
-
   app.use('/matches', matchesRoutes);
   app.use('/api/matches', matchesRoutes);
-
   app.use('/launcher', launcherRoutes);
   app.use('/api/launcher', launcherRoutes);
-
   app.use('/leaderboard', leaderboardRoutes);
   app.use('/api/leaderboard', leaderboardRoutes);
-
   app.use('/internal', internalRoutes);
   app.use('/api/internal', internalRoutes);
 
@@ -136,10 +124,8 @@ function setupRoutes() {
   });
 
   app.use((err, _req, res, _next) => {
-    const status = err?.statusCode || 500;
-    const message = err?.message || 'internal_error';
     console.error('[http] unhandled error:', err);
-    res.status(status).json({ ok: false, error: message });
+    res.status(err?.statusCode || 500).json({ ok: false, error: err?.message || 'internal_error' });
   });
 }
 
@@ -149,7 +135,7 @@ async function runMatchmakingTick() {
   try {
     await runMatchmakingCycle();
   } catch (error) {
-    console.error('[matchmaking] cycle error:', error);
+    console.error('matchmaking cycle error:', error);
   } finally {
     matchmakingRunning = false;
   }
@@ -157,9 +143,7 @@ async function runMatchmakingTick() {
 
 function startMatchmakingLoop() {
   if (matchmakingTimer) return;
-  matchmakingTimer = setInterval(() => {
-    void runMatchmakingTick();
-  }, MATCHMAKING_INTERVAL_MS);
+  matchmakingTimer = setInterval(() => { void runMatchmakingTick(); }, MATCHMAKING_INTERVAL_MS);
   if (typeof matchmakingTimer.unref === 'function') matchmakingTimer.unref();
   console.log(`[matchmaking] loop started (${MATCHMAKING_INTERVAL_MS} ms)`);
 }
@@ -176,8 +160,7 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
   console.log(`[bootstrap] received ${signal}, shutting down...`);
   stopMatchmakingLoop();
-  await new Promise((resolve) => server.close(resolve));
-  await pool.end().catch(() => {});
+  await new Promise((resolve) => server.close(() => resolve()));
   console.log('[bootstrap] shutdown complete');
   process.exit(0);
 }
@@ -187,9 +170,7 @@ async function bootstrap() {
     setupCoreMiddleware();
     setupRoutes();
     await initSchema();
-    server.listen(PORT, HOST, () => {
-      console.log(`TRUST backend listening on ${HOST}:${PORT}`);
-    });
+    server.listen(PORT, HOST, () => console.log(`TRUST backend listening on ${HOST}:${PORT}`));
     startMatchmakingLoop();
     process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
     process.on('SIGINT', () => void gracefulShutdown('SIGINT'));

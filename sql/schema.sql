@@ -98,12 +98,16 @@ CREATE TABLE IF NOT EXISTS matches (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   public_match_id TEXT NOT NULL UNIQUE,
   mode TEXT NOT NULL DEFAULT '2x2',
-  status TEXT NOT NULL DEFAULT 'pending',
+  status TEXT NOT NULL DEFAULT 'pending_acceptance',
   server_id TEXT,
   server_ip TEXT,
   server_port INTEGER,
   server_password TEXT,
-  map_name TEXT DEFAULT 'de_dust2',
+  map_name TEXT,
+  accepted_at TIMESTAMPTZ,
+  map_voting_started_at TIMESTAMPTZ,
+  map_voting_finished_at TIMESTAMPTZ,
+  selected_map_by TEXT,
   team_a_score INTEGER NOT NULL DEFAULT 0,
   team_b_score INTEGER NOT NULL DEFAULT 0,
   winner_team TEXT,
@@ -111,7 +115,7 @@ CREATE TABLE IF NOT EXISTS matches (
   started_at TIMESTAMPTZ,
   finished_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT matches_status_check CHECK (status IN ('pending','server_assigned','live','finished','cancelled')),
+  CONSTRAINT matches_status_check CHECK (status IN ('pending','pending_acceptance','map_voting','server_assigned','live','finished','cancelled')),
   CONSTRAINT matches_winner_team_check CHECK (winner_team IN ('A','B') OR winner_team IS NULL)
 );
 
@@ -122,6 +126,9 @@ CREATE TABLE IF NOT EXISTS match_players (
   party_id UUID REFERENCES parties(id) ON DELETE SET NULL,
   team TEXT NOT NULL,
   slot_index INTEGER NOT NULL,
+  accepted_at TIMESTAMPTZ,
+  map_vote TEXT,
+  map_vote_at TIMESTAMPTZ,
   elo_before INTEGER,
   elo_after INTEGER,
   elo_delta INTEGER,
@@ -148,14 +155,10 @@ CREATE TABLE IF NOT EXISTS server_instances (
 
 CREATE INDEX IF NOT EXISTS idx_users_steam_id ON users(steam_id);
 CREATE INDEX IF NOT EXISTS idx_users_persona_lower ON users(LOWER(persona_name));
-CREATE UNIQUE INDEX IF NOT EXISTS idx_parties_party_code_unique ON parties(party_code);
 CREATE INDEX IF NOT EXISTS idx_party_invites_to_user ON party_invites(to_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_queue_entries_status ON queue_entries(status, queued_at);
 CREATE INDEX IF NOT EXISTS idx_matches_status ON matches(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_match_players_user ON match_players(user_id);
 
-ALTER TABLE presence
-  DROP CONSTRAINT IF EXISTS presence_current_match_fkey;
-ALTER TABLE presence
-  ADD CONSTRAINT presence_current_match_fkey
-  FOREIGN KEY (current_match_id) REFERENCES matches(id) ON DELETE SET NULL;
+ALTER TABLE presence DROP CONSTRAINT IF EXISTS presence_current_match_fkey;
+ALTER TABLE presence ADD CONSTRAINT presence_current_match_fkey FOREIGN KEY (current_match_id) REFERENCES matches(id) ON DELETE SET NULL;
