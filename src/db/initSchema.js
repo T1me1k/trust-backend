@@ -18,6 +18,62 @@ async function columnExists(client, tableName, columnName) {
   return !!result.rows[0];
 }
 
+async function repairLegacyPartyTables(client) {
+  await client.query(`
+    ALTER TABLE parties
+      ADD COLUMN IF NOT EXISTS leader_user_id UUID,
+      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open',
+      ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '2x2',
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  `);
+
+  await client.query(`
+    ALTER TABLE party_members
+      ADD COLUMN IF NOT EXISTS party_id UUID,
+      ADD COLUMN IF NOT EXISTS user_id UUID,
+      ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member',
+      ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  `);
+
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints
+        WHERE table_name = 'party_members'
+          AND constraint_name = 'party_members_party_id_fkey'
+      ) THEN
+        ALTER TABLE party_members
+          ADD CONSTRAINT party_members_party_id_fkey
+          FOREIGN KEY (party_id) REFERENCES parties(id) ON DELETE CASCADE;
+      END IF;
+    END $$;
+  `);
+
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints
+        WHERE table_name = 'party_members'
+          AND constraint_name = 'party_members_user_id_fkey'
+      ) THEN
+        ALTER TABLE party_members
+          ADD CONSTRAINT party_members_user_id_fkey
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+      END IF;
+    END $$;
+  `);
+
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_party_members_party_user_unique
+      ON party_members(party_id, user_id);
+  `);
+}
+
 async function repairLegacyUsers(client) {
   await client.query(`
     ALTER TABLE users
@@ -170,7 +226,9 @@ async function initSchema() {
     await client.query(sql);
 
     await repairLegacyUsers(client);
-
+    
+await repairLegacyPartyTables(client);
+    
     const presenceHasUserId = await columnExists(client, 'presence', 'user_id');
     const presenceHasState = await columnExists(client, 'presence', 'state');
     const presenceHasCurrentPartyId = await columnExists(client, 'presence', 'current_party_id');
