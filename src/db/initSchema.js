@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { pool } = require('./index');
+const { pool } = require('../db');
 
 async function columnExists(client, tableName, columnName) {
   const result = await client.query(
