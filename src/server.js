@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
 const express = require('express');
 const cors = require('cors');
@@ -7,13 +9,6 @@ const cookieParser = require('cookie-parser');
 const config = require('./config');
 const { initSchema } = require('./db/initSchema');
 const { runMatchmakingCycle } = require('./services/queueService');
-
-const authRoutes = require('./routes/auth.routes');
-const partyRoutes = require('./routes/party.routes');
-const queueRoutes = require('./routes/queue.routes');
-const matchRoutes = require('./routes/match.routes');
-const publicRoutes = require('./routes/public.routes');
-const launcherRoutes = require('./routes/launcher.routes');
 
 const PORT = Number(process.env.PORT || config.port || 3000);
 const HOST = '0.0.0.0';
@@ -34,6 +29,38 @@ function getAllowedOrigins() {
     .split(',')
     .map((v) => v.trim())
     .filter(Boolean);
+}
+
+function tryRequire(modulePath) {
+  try {
+    return require(modulePath);
+  } catch (error) {
+    if (error && error.code === 'MODULE_NOT_FOUND') {
+      console.warn(`[server] optional module not found: ${modulePath}`);
+      return null;
+    }
+    throw error;
+  }
+}
+
+function resolveRouteFile(name) {
+  const fullPath = path.join(__dirname, 'routes', name);
+  return fs.existsSync(fullPath) ? fullPath : null;
+}
+
+function mountOptionalRouter(routeFileName, mountPaths) {
+  const resolved = resolveRouteFile(routeFileName);
+  if (!resolved) {
+    console.warn(`[server] route file missing: routes/${routeFileName}`);
+    return;
+  }
+
+  const router = tryRequire(resolved);
+  if (!router) return;
+
+  for (const mountPath of mountPaths) {
+    app.use(mountPath, router);
+  }
 }
 
 function setupCoreMiddleware() {
@@ -75,8 +102,8 @@ function setupCoreMiddleware() {
   );
 }
 
-function setupRoutes() {
-  app.get('/health', async (_req, res) => {
+function setupBaseRoutes() {
+  app.get('/health', (_req, res) => {
     res.status(200).json({
       ok: true,
       service: 'trust-backend',
@@ -85,7 +112,7 @@ function setupRoutes() {
     });
   });
 
-  app.get('/config', async (_req, res) => {
+  app.get('/config', (_req, res) => {
     res.status(200).json({
       ok: true,
       app: 'TRUST',
@@ -94,24 +121,15 @@ function setupRoutes() {
       region: process.env.DEFAULT_REGION || config.defaultRegion || 'EU'
     });
   });
+}
 
-  app.use('/auth', authRoutes);
-  app.use('/api/auth', authRoutes);
-
-  app.use('/party', partyRoutes);
-  app.use('/api/party', partyRoutes);
-
-  app.use('/queue', queueRoutes);
-  app.use('/api/queue', queueRoutes);
-
-  app.use('/match', matchRoutes);
-  app.use('/api/match', matchRoutes);
-
-  app.use('/launcher', launcherRoutes);
-  app.use('/api/launcher', launcherRoutes);
-
-  app.use('/', publicRoutes);
-  app.use('/api', publicRoutes);
+function setupAppRoutes() {
+  mountOptionalRouter('auth.routes.js', ['/auth', '/api/auth']);
+  mountOptionalRouter('party.routes.js', ['/party', '/api/party']);
+  mountOptionalRouter('queue.routes.js', ['/queue', '/api/queue']);
+  mountOptionalRouter('match.routes.js', ['/match', '/api/match']);
+  mountOptionalRouter('launcher.routes.js', ['/launcher', '/api/launcher']);
+  mountOptionalRouter('public.routes.js', ['/', '/api']);
 
   app.use((req, res) => {
     res.status(404).json({
@@ -187,7 +205,8 @@ async function gracefulShutdown(signal) {
 async function bootstrap() {
   try {
     setupCoreMiddleware();
-    setupRoutes();
+    setupBaseRoutes();
+    setupAppRoutes();
 
     await initSchema();
 
