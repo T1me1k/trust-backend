@@ -3,8 +3,10 @@ const express = require('express');
 const cors = require('cors');
 const session = require('express-session');
 const cookieParser = require('cookie-parser');
+const PgSession = require('connect-pg-simple')(session);
 
 const config = require('./config');
+const { pool } = require('./db');
 const { initSchema } = require('./db/initSchema');
 const { runMatchmakingCycle } = require('./services/queueService');
 
@@ -15,12 +17,11 @@ const queueRoutes = require('./routes/queue.routes');
 const matchesRoutes = require('./routes/matches.routes');
 const launcherRoutes = require('./routes/launcher.routes');
 const leaderboardRoutes = require('./routes/leaderboard.routes');
+const internalRoutes = require('./routes/internal.routes');
 
 const PORT = Number(process.env.PORT || config.port || 3000);
 const HOST = '0.0.0.0';
-const MATCHMAKING_INTERVAL_MS = Number(
-  process.env.MATCHMAKING_INTERVAL_MS || config.matchmakingIntervalMs || 3000
-);
+const MATCHMAKING_INTERVAL_MS = Number(process.env.MATCHMAKING_INTERVAL_MS || config.matchmakingIntervalMs || 3000);
 
 const app = express();
 const server = http.createServer(app);
@@ -61,14 +62,20 @@ function setupCoreMiddleware() {
 
   app.use(
     session({
+      store: new PgSession({
+        pool,
+        tableName: 'user_sessions',
+        createTableIfMissing: true
+      }),
       name: 'trust.sid',
       secret: process.env.SESSION_SECRET || config.sessionSecret || 'change-me',
       resave: false,
       saveUninitialized: false,
       rolling: true,
+      proxy: true,
       cookie: {
         httpOnly: true,
-        secure: true,
+        secure: String(process.env.COOKIE_SECURE ?? config.cookieSecure ?? 'true') === 'true',
         sameSite: 'none',
         maxAge: 1000 * 60 * 60 * 24 * 30
       }
@@ -91,10 +98,11 @@ function setupRoutes() {
       ok: true,
       config: {
         appName: 'TRUST',
-        latestVersion: '2.0.2',
-        mode: process.env.DEFAULT_MATCH_MODE || config.defaultMatchMode || '2x2',
+        latestVersion: '2.1.0',
+        mode: '2x2',
         region: process.env.DEFAULT_REGION || config.defaultRegion || 'EU',
-        matchmakingEnabled: true
+        matchmakingEnabled: true,
+        queueModel: 'solo_duo_2x2'
       }
     });
   });
@@ -120,35 +128,28 @@ function setupRoutes() {
   app.use('/leaderboard', leaderboardRoutes);
   app.use('/api/leaderboard', leaderboardRoutes);
 
+  app.use('/internal', internalRoutes);
+  app.use('/api/internal', internalRoutes);
+
   app.use((req, res) => {
-    res.status(404).json({
-      ok: false,
-      error: 'not_found',
-      path: req.originalUrl
-    });
+    res.status(404).json({ ok: false, error: 'not_found', path: req.originalUrl });
   });
 
   app.use((err, _req, res, _next) => {
-    const message = err && err.message ? err.message : 'internal_error';
-    const status = err && err.statusCode ? err.statusCode : 500;
-
+    const status = err?.statusCode || 500;
+    const message = err?.message || 'internal_error';
     console.error('[http] unhandled error:', err);
-
-    res.status(status).json({
-      ok: false,
-      error: message
-    });
+    res.status(status).json({ ok: false, error: message });
   });
 }
 
 async function runMatchmakingTick() {
   if (matchmakingRunning || shuttingDown) return;
-
   matchmakingRunning = true;
   try {
     await runMatchmakingCycle();
   } catch (error) {
-    console.error('matchmaking cycle error:', error);
+    console.error('[matchmaking] cycle error:', error);
   } finally {
     matchmakingRunning = false;
   }
@@ -156,15 +157,10 @@ async function runMatchmakingTick() {
 
 function startMatchmakingLoop() {
   if (matchmakingTimer) return;
-
   matchmakingTimer = setInterval(() => {
     void runMatchmakingTick();
   }, MATCHMAKING_INTERVAL_MS);
-
-  if (typeof matchmakingTimer.unref === 'function') {
-    matchmakingTimer.unref();
-  }
-
+  if (typeof matchmakingTimer.unref === 'function') matchmakingTimer.unref();
   console.log(`[matchmaking] loop started (${MATCHMAKING_INTERVAL_MS} ms)`);
 }
 
@@ -178,14 +174,10 @@ function stopMatchmakingLoop() {
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-
   console.log(`[bootstrap] received ${signal}, shutting down...`);
   stopMatchmakingLoop();
-
-  await new Promise((resolve) => {
-    server.close(() => resolve());
-  });
-
+  await new Promise((resolve) => server.close(resolve));
+  await pool.end().catch(() => {});
   console.log('[bootstrap] shutdown complete');
   process.exit(0);
 }
@@ -194,25 +186,15 @@ async function bootstrap() {
   try {
     setupCoreMiddleware();
     setupRoutes();
-
     await initSchema();
-
     server.listen(PORT, HOST, () => {
       console.log(`TRUST backend listening on ${HOST}:${PORT}`);
     });
-
     startMatchmakingLoop();
-
     process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
     process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
-
-    process.on('unhandledRejection', (reason) => {
-      console.error('[process] unhandledRejection:', reason);
-    });
-
-    process.on('uncaughtException', (error) => {
-      console.error('[process] uncaughtException:', error);
-    });
+    process.on('unhandledRejection', (reason) => console.error('[process] unhandledRejection:', reason));
+    process.on('uncaughtException', (error) => console.error('[process] uncaughtException:', error));
   } catch (error) {
     console.error('[bootstrap] failed to start:', error);
     process.exit(1);

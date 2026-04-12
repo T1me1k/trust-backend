@@ -42,7 +42,7 @@ async function getPartyForQueue(userId) {
   return party;
 }
 
-async function joinQueue(userId) {
+async function joinQueue(userId, _mode = '2x2') {
   const party = await getPartyForQueue(userId);
   if (!party || !party.id) throw new Error('party_not_found');
   if (party.leader_user_id !== userId) throw new Error('not_party_leader');
@@ -63,14 +63,14 @@ async function joinQueue(userId) {
                      status = 'queued',
                      queued_at = NOW(),
                      matched_at = NULL`,
-      [party.id, userId, mode]
+      [party.id, userId, '2x2']
     );
 
     await client.query(
       `UPDATE parties
        SET status = 'searching', queue_mode = $2, updated_at = NOW()
        WHERE id = $1`,
-      [party.id, mode]
+      [party.id, '2x2']
     );
   });
 

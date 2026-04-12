@@ -84,12 +84,25 @@ async function ensureLegacyCoreColumns(client) {
 
   await client.query(`
     ALTER TABLE parties
+      ADD COLUMN IF NOT EXISTS party_code TEXT,
       ADD COLUMN IF NOT EXISTS leader_user_id UUID,
       ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open',
       ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '2x2',
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
   `);
+
+  await client.query(`
+    UPDATE parties
+    SET party_code = UPPER(SUBSTRING(REPLACE(gen_random_uuid()::text, '-', '') FROM 1 FOR 6))
+    WHERE party_code IS NULL OR TRIM(party_code) = '';
+  `);
+
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_parties_party_code_unique
+      ON parties(party_code);
+  `);
+
 
   await client.query(`
     ALTER TABLE party_members

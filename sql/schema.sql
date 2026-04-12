@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS launcher_link_codes (
 
 CREATE TABLE IF NOT EXISTS parties (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  party_code TEXT NOT NULL UNIQUE,
   leader_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   status TEXT NOT NULL DEFAULT 'open',
   queue_mode TEXT NOT NULL DEFAULT '2x2',
@@ -147,6 +148,7 @@ CREATE TABLE IF NOT EXISTS server_instances (
 
 CREATE INDEX IF NOT EXISTS idx_users_steam_id ON users(steam_id);
 CREATE INDEX IF NOT EXISTS idx_users_persona_lower ON users(LOWER(persona_name));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_parties_party_code_unique ON parties(party_code);
 CREATE INDEX IF NOT EXISTS idx_party_invites_to_user ON party_invites(to_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_queue_entries_status ON queue_entries(status, queued_at);
 CREATE INDEX IF NOT EXISTS idx_matches_status ON matches(status, created_at DESC);

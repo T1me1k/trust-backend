@@ -1,28 +1,18 @@
+const crypto = require('crypto');
 const { query, withTransaction } = require('../db');
 const { setPresence } = require('./accountService');
 
-function normalizeMember(row) {
-  return {
-    userId: row.user_id,
-    role: row.role,
-    nickname: row.persona_name,
-    avatarUrl: row.avatar_full_url || null,
-    elo2v2: Number(row.elo_2v2 || 100)
-  };
+function generatePartyCode() {
+  return crypto.randomBytes(3).toString('hex').toUpperCase();
 }
 
-function normalizeInvite(row) {
-  return {
-    id: row.id,
-    partyId: row.party_id,
-    fromUserId: row.from_user_id,
-    toUserId: row.to_user_id,
-    status: row.status,
-    createdAt: row.created_at,
-    expiresAt: row.expires_at,
-    fromNickname: row.from_nickname,
-    fromAvatarUrl: row.from_avatar_url || null
-  };
+async function reserveUniquePartyCode(client) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const partyCode = generatePartyCode();
+    const exists = await client.query('SELECT 1 FROM parties WHERE party_code = $1 LIMIT 1', [partyCode]);
+    if (!exists.rows[0]) return partyCode;
+  }
+  throw new Error('party_code_generation_failed');
 }
 
 async function getIncomingInvitesByUserId(userId) {
@@ -46,7 +36,17 @@ async function getIncomingInvitesByUserId(userId) {
     [userId]
   );
 
-  return result.rows.map(normalizeInvite);
+  return result.rows.map((row) => ({
+    id: row.id,
+    partyId: row.party_id,
+    fromUserId: row.from_user_id,
+    toUserId: row.to_user_id,
+    status: row.status,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    fromNickname: row.from_nickname,
+    fromAvatarUrl: row.from_avatar_url || null
+  }));
 }
 
 async function getCurrentPartyByUserId(userId) {
@@ -56,7 +56,6 @@ async function getCurrentPartyByUserId(userId) {
      JOIN parties p ON p.id = pm.party_id
      WHERE pm.user_id = $1
        AND p.status <> 'closed'
-     ORDER BY p.created_at DESC
      LIMIT 1`,
     [userId]
   );
@@ -67,12 +66,12 @@ async function getCurrentPartyByUserId(userId) {
   if (!party) {
     return {
       id: null,
+      partyCode: null,
       isLeader: false,
-      status: null,
-      queueMode: null,
-      leader_user_id: null,
       members: [],
-      pendingInvites: incomingInvites
+      pendingInvites: incomingInvites,
+      status: null,
+      leader_user_id: null
     };
   }
 
@@ -91,11 +90,19 @@ async function getCurrentPartyByUserId(userId) {
     [party.id]
   );
 
+  const members = membersResult.rows.map((row) => ({
+    userId: row.user_id,
+    role: row.role,
+    nickname: row.persona_name,
+    avatarUrl: row.avatar_full_url || null,
+    elo2v2: Number(row.elo_2v2 || 100)
+  }));
+
   return {
     ...party,
-    queueMode: party.queue_mode || '2x2',
+    partyCode: party.party_code || null,
     isLeader: party.leader_user_id === userId,
-    members: membersResult.rows.map(normalizeMember),
+    members,
     pendingInvites: incomingInvites
   };
 }
@@ -105,19 +112,19 @@ async function createParty(userId) {
   if (existing && existing.id) return existing;
 
   const party = await withTransaction(async (client) => {
+    const partyCode = await reserveUniquePartyCode(client);
     const partyResult = await client.query(
-      `INSERT INTO parties (leader_user_id, status, queue_mode, created_at, updated_at)
-       VALUES ($1, 'open', '2x2', NOW(), NOW())
+      `INSERT INTO parties (leader_user_id, party_code, status, queue_mode, created_at, updated_at)
+       VALUES ($1, $2, 'open', '2x2', NOW(), NOW())
        RETURNING *`,
-      [userId]
+      [userId, partyCode]
     );
 
     const row = partyResult.rows[0];
 
     await client.query(
       `INSERT INTO party_members (party_id, user_id, role, joined_at)
-       VALUES ($1, $2, 'leader', NOW())
-       ON CONFLICT (party_id, user_id) DO NOTHING`,
+       VALUES ($1, $2, 'leader', NOW())`,
       [row.id, userId]
     );
 
@@ -200,13 +207,7 @@ async function acceptInvite(inviteId, userId) {
 
     if (membersCount.rows[0].c >= 2) throw new Error('party_full');
 
-    await client.query(
-      `UPDATE party_invites
-       SET status = 'accepted'
-       WHERE id = $1`,
-      [inviteId]
-    );
-
+    await client.query(`UPDATE party_invites SET status = 'accepted' WHERE id = $1`, [inviteId]);
     await client.query(
       `INSERT INTO party_members (party_id, user_id, role, joined_at)
        VALUES ($1, $2, 'member', NOW())`,
@@ -236,55 +237,23 @@ async function leaveParty(userId) {
   if (!party || !party.id) return null;
 
   await withTransaction(async (client) => {
-    await client.query(
-      `DELETE FROM party_members
-       WHERE party_id = $1 AND user_id = $2`,
-      [party.id, userId]
-    );
+    await client.query(`DELETE FROM party_members WHERE party_id = $1 AND user_id = $2`, [party.id, userId]);
 
     const members = await client.query(
-      `SELECT user_id
-       FROM party_members
-       WHERE party_id = $1
-       ORDER BY joined_at ASC`,
+      `SELECT user_id FROM party_members WHERE party_id = $1 ORDER BY joined_at ASC`,
       [party.id]
     );
 
     if (members.rows.length === 0) {
-      await client.query(
-        `UPDATE parties
-         SET status = 'closed', updated_at = NOW()
-         WHERE id = $1`,
-        [party.id]
-      );
-
-      await client.query(
-        `UPDATE queue_entries
-         SET status = 'cancelled'
-         WHERE party_id = $1 AND status = 'queued'`,
-        [party.id]
-      );
-
-      await client.query(
-        `UPDATE party_invites
-         SET status = 'cancelled'
-         WHERE party_id = $1 AND status = 'pending'`,
-        [party.id]
-      );
-
+      await client.query(`UPDATE parties SET status = 'closed', updated_at = NOW() WHERE id = $1`, [party.id]);
+      await client.query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status = 'queued'`, [party.id]);
+      await client.query(`UPDATE party_invites SET status = 'cancelled' WHERE party_id = $1 AND status = 'pending'`, [party.id]);
       return;
     }
 
     if (party.leader_user_id === userId) {
       const newLeaderId = members.rows[0].user_id;
-
-      await client.query(
-        `UPDATE parties
-         SET leader_user_id = $2, updated_at = NOW()
-         WHERE id = $1`,
-        [party.id, newLeaderId]
-      );
-
+      await client.query(`UPDATE parties SET leader_user_id = $2, updated_at = NOW() WHERE id = $1`, [party.id, newLeaderId]);
       await client.query(
         `UPDATE party_members
          SET role = CASE WHEN user_id = $2 THEN 'leader' ELSE 'member' END
@@ -304,32 +273,10 @@ async function disbandParty(userId) {
   if (party.leader_user_id !== userId) throw new Error('not_party_leader');
 
   await withTransaction(async (client) => {
-    await client.query(
-      `UPDATE parties
-       SET status = 'closed', updated_at = NOW()
-       WHERE id = $1`,
-      [party.id]
-    );
-
-    await client.query(
-      `DELETE FROM party_members
-       WHERE party_id = $1`,
-      [party.id]
-    );
-
-    await client.query(
-      `UPDATE queue_entries
-       SET status = 'cancelled'
-       WHERE party_id = $1 AND status = 'queued'`,
-      [party.id]
-    );
-
-    await client.query(
-      `UPDATE party_invites
-       SET status = 'cancelled'
-       WHERE party_id = $1 AND status = 'pending'`,
-      [party.id]
-    );
+    await client.query(`UPDATE parties SET status = 'closed', updated_at = NOW() WHERE id = $1`, [party.id]);
+    await client.query(`DELETE FROM party_members WHERE party_id = $1`, [party.id]);
+    await client.query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status = 'queued'`, [party.id]);
+    await client.query(`UPDATE party_invites SET status = 'cancelled' WHERE party_id = $1 AND status = 'pending'`, [party.id]);
   });
 
   for (const member of party.members) {
