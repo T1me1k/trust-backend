@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const session = require('express-session');
 const cookieParser = require('cookie-parser');
-const passport = require('passport');
 
 const config = require('./config');
 const { initSchema } = require('./db/initSchema');
@@ -74,9 +73,6 @@ function setupCoreMiddleware() {
       }
     })
   );
-
-  app.use(passport.initialize());
-  app.use(passport.session());
 }
 
 function setupRoutes() {
