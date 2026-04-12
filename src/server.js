@@ -92,12 +92,12 @@ function setupCoreMiddleware() {
       resave: false,
       saveUninitialized: false,
       rolling: true,
-      cookie: {
-        httpOnly: true,
-        secure: String(process.env.COOKIE_SECURE || config.cookieSecure || 'false') === 'true',
-        sameSite: 'lax',
-        maxAge: 1000 * 60 * 60 * 24 * 30
-      }
+     cookie: {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'none',
+  maxAge: 1000 * 60 * 60 * 24 * 30
+}
     })
   );
 }
