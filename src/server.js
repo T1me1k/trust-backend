@@ -1,5 +1,3 @@
-const fs = require('fs');
-const path = require('path');
 const http = require('http');
 const express = require('express');
 const cors = require('cors');
@@ -9,6 +7,14 @@ const cookieParser = require('cookie-parser');
 const config = require('./config');
 const { initSchema } = require('./db/initSchema');
 const { runMatchmakingCycle } = require('./services/queueService');
+
+const authRoutes = require('./routes/auth.routes');
+const accountRoutes = require('./routes/account.routes');
+const partyRoutes = require('./routes/party.routes');
+const queueRoutes = require('./routes/queue.routes');
+const matchesRoutes = require('./routes/matches.routes');
+const launcherRoutes = require('./routes/launcher.routes');
+const leaderboardRoutes = require('./routes/leaderboard.routes');
 
 const PORT = Number(process.env.PORT || config.port || 3000);
 const HOST = '0.0.0.0';
@@ -29,38 +35,6 @@ function getAllowedOrigins() {
     .split(',')
     .map((v) => v.trim())
     .filter(Boolean);
-}
-
-function tryRequire(modulePath) {
-  try {
-    return require(modulePath);
-  } catch (error) {
-    if (error && error.code === 'MODULE_NOT_FOUND') {
-      console.warn(`[server] optional module not found: ${modulePath}`);
-      return null;
-    }
-    throw error;
-  }
-}
-
-function resolveRouteFile(name) {
-  const fullPath = path.join(__dirname, 'routes', name);
-  return fs.existsSync(fullPath) ? fullPath : null;
-}
-
-function mountOptionalRouter(routeFileName, mountPaths) {
-  const resolved = resolveRouteFile(routeFileName);
-  if (!resolved) {
-    console.warn(`[server] route file missing: routes/${routeFileName}`);
-    return;
-  }
-
-  const router = tryRequire(resolved);
-  if (!router) return;
-
-  for (const mountPath of mountPaths) {
-    app.use(mountPath, router);
-  }
 }
 
 function setupCoreMiddleware() {
@@ -92,17 +66,17 @@ function setupCoreMiddleware() {
       resave: false,
       saveUninitialized: false,
       rolling: true,
-     cookie: {
-  httpOnly: true,
-  secure: true,
-  sameSite: 'none',
-  maxAge: 1000 * 60 * 60 * 24 * 30
-}
+      cookie: {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'none',
+        maxAge: 1000 * 60 * 60 * 24 * 30
+      }
     })
   );
 }
 
-function setupBaseRoutes() {
+function setupRoutes() {
   app.get('/health', (_req, res) => {
     res.status(200).json({
       ok: true,
@@ -115,21 +89,36 @@ function setupBaseRoutes() {
   app.get('/config', (_req, res) => {
     res.status(200).json({
       ok: true,
-      app: 'TRUST',
-      version: '2.0.2',
-      mode: process.env.DEFAULT_MATCH_MODE || config.defaultMatchMode || '2x2',
-      region: process.env.DEFAULT_REGION || config.defaultRegion || 'EU'
+      config: {
+        appName: 'TRUST',
+        latestVersion: '2.0.2',
+        mode: process.env.DEFAULT_MATCH_MODE || config.defaultMatchMode || '2x2',
+        region: process.env.DEFAULT_REGION || config.defaultRegion || 'EU',
+        matchmakingEnabled: true
+      }
     });
   });
-}
 
-function setupAppRoutes() {
-  mountOptionalRouter('auth.routes.js', ['/auth', '/api/auth']);
-  mountOptionalRouter('party.routes.js', ['/party', '/api/party']);
-  mountOptionalRouter('queue.routes.js', ['/queue', '/api/queue']);
-  mountOptionalRouter('match.routes.js', ['/match', '/api/match']);
-  mountOptionalRouter('launcher.routes.js', ['/launcher', '/api/launcher']);
-  mountOptionalRouter('public.routes.js', ['/', '/api']);
+  app.use('/auth', authRoutes);
+  app.use('/api/auth', authRoutes);
+
+  app.use('/account', accountRoutes);
+  app.use('/api/account', accountRoutes);
+
+  app.use('/party', partyRoutes);
+  app.use('/api/party', partyRoutes);
+
+  app.use('/queue', queueRoutes);
+  app.use('/api/queue', queueRoutes);
+
+  app.use('/matches', matchesRoutes);
+  app.use('/api/matches', matchesRoutes);
+
+  app.use('/launcher', launcherRoutes);
+  app.use('/api/launcher', launcherRoutes);
+
+  app.use('/leaderboard', leaderboardRoutes);
+  app.use('/api/leaderboard', leaderboardRoutes);
 
   app.use((req, res) => {
     res.status(404).json({
@@ -191,7 +180,6 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
 
   console.log(`[bootstrap] received ${signal}, shutting down...`);
-
   stopMatchmakingLoop();
 
   await new Promise((resolve) => {
@@ -205,8 +193,7 @@ async function gracefulShutdown(signal) {
 async function bootstrap() {
   try {
     setupCoreMiddleware();
-    setupBaseRoutes();
-    setupAppRoutes();
+    setupRoutes();
 
     await initSchema();
 
@@ -216,13 +203,8 @@ async function bootstrap() {
 
     startMatchmakingLoop();
 
-    process.on('SIGTERM', () => {
-      void gracefulShutdown('SIGTERM');
-    });
-
-    process.on('SIGINT', () => {
-      void gracefulShutdown('SIGINT');
-    });
+    process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
 
     process.on('unhandledRejection', (reason) => {
       console.error('[process] unhandledRejection:', reason);
