@@ -1,112 +1,220 @@
-require('dotenv').config();
+const http = require('http');
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
 const session = require('express-session');
-const PgSession = require('connect-pg-simple')(session);
 const cookieParser = require('cookie-parser');
+const passport = require('passport');
 
 const config = require('./config');
-const { pool } = require('./db');
 const { initSchema } = require('./db/initSchema');
-const { ok } = require('./utils/http');
 const { runMatchmakingCycle } = require('./services/queueService');
 
 const authRoutes = require('./routes/auth.routes');
-const accountRoutes = require('./routes/account.routes');
 const partyRoutes = require('./routes/party.routes');
 const queueRoutes = require('./routes/queue.routes');
-const matchesRoutes = require('./routes/matches.routes');
-const leaderboardRoutes = require('./routes/leaderboard.routes');
-const internalRoutes = require('./routes/internal.routes');
+const matchRoutes = require('./routes/match.routes');
+const publicRoutes = require('./routes/public.routes');
 const launcherRoutes = require('./routes/launcher.routes');
 
+const PORT = Number(process.env.PORT || config.port || 3000);
+const HOST = '0.0.0.0';
+const MATCHMAKING_INTERVAL_MS = Number(
+  process.env.MATCHMAKING_INTERVAL_MS || config.matchmakingIntervalMs || 3000
+);
+
 const app = express();
-app.set('trust proxy', 1);
+const server = http.createServer(app);
 
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (config.allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error(`CORS blocked for origin: ${origin}`));
-  },
-  credentials: true
-}));
+let matchmakingTimer = null;
+let matchmakingRunning = false;
+let shuttingDown = false;
 
-app.use(express.json());
-app.use(cookieParser());
-app.use(session({
-  store: new PgSession({
-    pool,
-    tableName: 'user_sessions',
-    createTableIfMissing: true
-  }),
-  name: 'trust.sid',
-  secret: config.sessionSecret,
-  resave: false,
-  saveUninitialized: false,
-  proxy: true,
-  cookie: {
-    httpOnly: true,
-    secure: config.cookieSecure,
-    sameSite: config.cookieSecure ? 'none' : 'lax',
-    maxAge: 1000 * 60 * 60 * 24 * 30
-  }
-}));
+function getAllowedOrigins() {
+  const raw = config.allowedOrigins || process.env.ALLOWED_ORIGINS || '';
+  return String(raw)
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
 
-app.get('/', (req, res) => ok(res, { service: 'trust-backend', version: '2.0.2' }));
-app.get('/health', async (req, res, next) => {
+function setupCoreMiddleware() {
+  const allowedOrigins = getAllowedOrigins();
+
+  app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+
+  app.use(
+    cors({
+      origin(origin, callback) {
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.length === 0) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error(`CORS blocked for origin: ${origin}`));
+      },
+      credentials: true
+    })
+  );
+
+  app.use(express.json({ limit: '1mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+  app.use(cookieParser());
+
+  app.use(
+    session({
+      name: 'trust.sid',
+      secret: process.env.SESSION_SECRET || config.sessionSecret || 'change-me',
+      resave: false,
+      saveUninitialized: false,
+      rolling: true,
+      cookie: {
+        httpOnly: true,
+        secure: String(process.env.COOKIE_SECURE || config.cookieSecure || 'false') === 'true',
+        sameSite: 'lax',
+        maxAge: 1000 * 60 * 60 * 24 * 30
+      }
+    })
+  );
+
+  app.use(passport.initialize());
+  app.use(passport.session());
+}
+
+function setupRoutes() {
+  app.get('/health', async (_req, res) => {
+    res.status(200).json({
+      ok: true,
+      service: 'trust-backend',
+      uptimeSec: Math.floor(process.uptime()),
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  app.get('/config', async (_req, res) => {
+    res.status(200).json({
+      ok: true,
+      app: 'TRUST',
+      version: '2.0.2',
+      mode: process.env.DEFAULT_MATCH_MODE || config.defaultMatchMode || '2x2',
+      region: process.env.DEFAULT_REGION || config.defaultRegion || 'EU'
+    });
+  });
+
+  app.use('/auth', authRoutes);
+  app.use('/api/auth', authRoutes);
+
+  app.use('/party', partyRoutes);
+  app.use('/api/party', partyRoutes);
+
+  app.use('/queue', queueRoutes);
+  app.use('/api/queue', queueRoutes);
+
+  app.use('/match', matchRoutes);
+  app.use('/api/match', matchRoutes);
+
+  app.use('/launcher', launcherRoutes);
+  app.use('/api/launcher', launcherRoutes);
+
+  app.use('/', publicRoutes);
+  app.use('/api', publicRoutes);
+
+  app.use((req, res) => {
+    res.status(404).json({
+      ok: false,
+      error: 'not_found',
+      path: req.originalUrl
+    });
+  });
+
+  app.use((err, _req, res, _next) => {
+    const message = err && err.message ? err.message : 'internal_error';
+    const status = err && err.statusCode ? err.statusCode : 500;
+
+    console.error('[http] unhandled error:', err);
+
+    res.status(status).json({
+      ok: false,
+      error: message
+    });
+  });
+}
+
+async function runMatchmakingTick() {
+  if (matchmakingRunning || shuttingDown) return;
+
+  matchmakingRunning = true;
   try {
-    await pool.query('SELECT 1');
-    return ok(res, { status: 'online', timestamp: Date.now() });
-  } catch (err) {
-    return next(err);
+    await runMatchmakingCycle();
+  } catch (error) {
+    console.error('matchmaking cycle error:', error);
+  } finally {
+    matchmakingRunning = false;
   }
-});
-app.get('/config', (req, res) => ok(res, {
-  config: {
-    appName: 'TRUST',
-    latestVersion: '0.2.0',
-    matchmakingEnabled: true,
-    maintenance: false,
-    motd: 'TRUST backend is online',
-    mode: config.defaultMatchMode
-  }
-}));
+}
 
-app.use('/auth', authRoutes);
-app.use('/api/account', accountRoutes);
-app.use('/api/party', partyRoutes);
-app.use('/api/queue', queueRoutes);
-app.use('/api/web-queue', queueRoutes);
-app.use('/api/matches', matchesRoutes);
-app.use('/api/leaderboard', leaderboardRoutes);
-app.use('/internal', internalRoutes);
-app.use('/launcher', launcherRoutes);
+function startMatchmakingLoop() {
+  if (matchmakingTimer) return;
 
-app.use((err, req, res, next) => {
-  console.error('unhandled error:', err);
-  if (err && typeof err.message === 'string' && err.message.startsWith('CORS blocked')) {
-    return res.status(403).json({ ok: false, error: 'cors_blocked' });
+  matchmakingTimer = setInterval(() => {
+    void runMatchmakingTick();
+  }, MATCHMAKING_INTERVAL_MS);
+
+  if (typeof matchmakingTimer.unref === 'function') {
+    matchmakingTimer.unref();
   }
-  return res.status(500).json({ ok: false, error: 'internal_error' });
-});
+
+  console.log(`[matchmaking] loop started (${MATCHMAKING_INTERVAL_MS} ms)`);
+}
+
+function stopMatchmakingLoop() {
+  if (!matchmakingTimer) return;
+  clearInterval(matchmakingTimer);
+  matchmakingTimer = null;
+  console.log('[matchmaking] loop stopped');
+}
+
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`[bootstrap] received ${signal}, shutting down...`);
+
+  stopMatchmakingLoop();
+
+  await new Promise((resolve) => {
+    server.close(() => resolve());
+  });
+
+  console.log('[bootstrap] shutdown complete');
+  process.exit(0);
+}
 
 async function bootstrap() {
   try {
+    setupCoreMiddleware();
+    setupRoutes();
+
     await initSchema();
 
-    setInterval(async () => {
-      try {
-        await runMatchmakingCycle();
-      } catch (err) {
-        console.error('matchmaking cycle error:', err);
-      }
-    }, config.matchmakingIntervalMs);
+    server.listen(PORT, HOST, () => {
+      console.log(`TRUST backend listening on ${HOST}:${PORT}`);
+    });
 
-    app.listen(config.port, () => {
-      console.log(`TRUST backend listening on :${config.port}`);
+    startMatchmakingLoop();
+
+    process.on('SIGTERM', () => {
+      void gracefulShutdown('SIGTERM');
+    });
+
+    process.on('SIGINT', () => {
+      void gracefulShutdown('SIGINT');
+    });
+
+    process.on('unhandledRejection', (reason) => {
+      console.error('[process] unhandledRejection:', reason);
+    });
+
+    process.on('uncaughtException', (error) => {
+      console.error('[process] uncaughtException:', error);
     });
   } catch (error) {
     console.error('[bootstrap] failed to start:', error);
@@ -114,4 +222,4 @@ async function bootstrap() {
   }
 }
 
-bootstrap();
+void bootstrap();
