@@ -12,6 +12,26 @@ function toOrigin(value) {
   }
 }
 
+function splitOrigins(value) {
+  if (!value) return [];
+  return String(value)
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map(toOrigin)
+    .filter(Boolean);
+}
+
+const allowedOrigins = Array.from(new Set([
+  ...splitOrigins(process.env.ALLOWED_ORIGINS),
+  toOrigin(process.env.SITE_ORIGIN || ''),
+  toOrigin(process.env.PUBLIC_SITE_URL || ''),
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173'
+].filter(Boolean)));
+
 module.exports = {
   port: Number(process.env.PORT || 3000),
   backendBaseUrl: process.env.BACKEND_BASE_URL || '',
@@ -26,10 +46,5 @@ module.exports = {
   defaultServerPort: Number(process.env.DEFAULT_SERVER_PORT || 27015),
   defaultServerPassword: process.env.DEFAULT_SERVER_PASSWORD || 'trust',
   matchmakingIntervalMs: Number(process.env.MATCHMAKING_INTERVAL_MS || 3000),
-  allowedOrigins: Array.from(new Set([
-    process.env.SITE_ORIGIN || process.env.PUBLIC_SITE_URL || '',
-    process.env.PUBLIC_SITE_URL || '',
-    ...(process.env.ALLOWED_ORIGINS || '').split(',')
-  ].map(toOrigin).filter(Boolean))),
-  authTokenTtlDays: Number(process.env.AUTH_TOKEN_TTL_DAYS || 30)
+  allowedOrigins
 };

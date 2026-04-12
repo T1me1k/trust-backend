@@ -1,6 +1,6 @@
 {
   "name": "trust-backend",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "TRUST backend for Steam auth, parties, queue, matches and leaderboard",
   "main": "src/server.js",
   "scripts": {

@@ -8,6 +8,7 @@ const cookieParser = require('cookie-parser');
 
 const config = require('./config');
 const { pool } = require('./db');
+const { initSchema } = require('./db/initSchema');
 const { ok } = require('./utils/http');
 const { runMatchmakingCycle } = require('./services/queueService');
 
@@ -54,7 +55,7 @@ app.use(session({
   }
 }));
 
-app.get('/', (req, res) => ok(res, { service: 'trust-backend', version: '2.0.1' }));
+app.get('/', (req, res) => ok(res, { service: 'trust-backend', version: '2.0.2' }));
 app.get('/health', async (req, res, next) => {
   try {
     await pool.query('SELECT 1');
@@ -89,17 +90,28 @@ app.use((err, req, res, next) => {
   if (err && typeof err.message === 'string' && err.message.startsWith('CORS blocked')) {
     return res.status(403).json({ ok: false, error: 'cors_blocked' });
   }
-  res.status(500).json({ ok: false, error: 'internal_error' });
+  return res.status(500).json({ ok: false, error: 'internal_error' });
 });
 
-setInterval(async () => {
+async function bootstrap() {
   try {
-    await runMatchmakingCycle();
-  } catch (err) {
-    console.error('matchmaking cycle error:', err);
-  }
-}, config.matchmakingIntervalMs);
+    await initSchema();
 
-app.listen(config.port, () => {
-  console.log(`TRUST backend listening on :${config.port}`);
-});
+    setInterval(async () => {
+      try {
+        await runMatchmakingCycle();
+      } catch (err) {
+        console.error('matchmaking cycle error:', err);
+      }
+    }, config.matchmakingIntervalMs);
+
+    app.listen(config.port, () => {
+      console.log(`TRUST backend listening on :${config.port}`);
+    });
+  } catch (error) {
+    console.error('[bootstrap] failed to start:', error);
+    process.exit(1);
+  }
+}
+
+bootstrap();
