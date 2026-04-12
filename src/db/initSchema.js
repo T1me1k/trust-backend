@@ -2,23 +2,86 @@ const fs = require('fs');
 const path = require('path');
 const { pool } = require('../db');
 
-async function columnExists(client, tableName, columnName) {
-  const result = await client.query(
-    `
-      SELECT 1
-      FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = $1
-        AND column_name = $2
-      LIMIT 1
-    `,
-    [tableName, columnName]
-  );
+const MANAGED_TABLES = {
+  party_invites: ['id', 'party_id', 'from_user_id', 'to_user_id', 'status', 'created_at', 'expires_at'],
+  presence: ['user_id', 'state', 'current_party_id', 'current_match_id', 'updated_at'],
+  queue_entries: ['id', 'party_id', 'leader_user_id', 'mode', 'status', 'queued_at', 'matched_at'],
+  matches: ['id', 'public_match_id', 'mode', 'status', 'server_id', 'server_ip', 'server_port', 'server_password', 'map_name', 'team_a_score', 'team_b_score', 'winner_team', 'result_source', 'started_at', 'finished_at', 'created_at'],
+  match_players: ['id', 'match_id', 'user_id', 'party_id', 'team', 'slot_index', 'elo_before', 'elo_after', 'elo_delta', 'result', 'connected_at'],
+  server_instances: ['id', 'name', 'host', 'port', 'server_password', 'server_token', 'status', 'region', 'last_heartbeat_at']
+};
 
-  return !!result.rows[0];
+const RESET_ORDER = [
+  'match_players',
+  'presence',
+  'matches',
+  'queue_entries',
+  'party_invites',
+  'server_instances'
+];
+
+async function getPublicColumns(client, tableName) {
+  const result = await client.query(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1`,
+    [tableName]
+  );
+  return result.rows.map((row) => row.column_name);
 }
 
-async function repairLegacyPartyTables(client) {
+async function tableExists(client, tableName) {
+  const result = await client.query(
+    `SELECT EXISTS (
+       SELECT 1
+         FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = $1
+     ) AS exists`,
+    [tableName]
+  );
+  return !!result.rows[0]?.exists;
+}
+
+async function hasPrimaryKeyOnId(client, tableName) {
+  const result = await client.query(
+    `SELECT COUNT(*)::int AS c
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON tc.constraint_name = kcu.constraint_name
+        AND tc.table_schema = kcu.table_schema
+      WHERE tc.table_schema = 'public'
+        AND tc.table_name = $1
+        AND tc.constraint_type = 'PRIMARY KEY'
+        AND kcu.column_name = 'id'`,
+    [tableName]
+  );
+  return (result.rows[0]?.c || 0) > 0;
+}
+
+async function ensureLegacyCoreColumns(client) {
+  await client.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS profile_url TEXT,
+      ADD COLUMN IF NOT EXISTS avatar_url TEXT,
+      ADD COLUMN IF NOT EXISTS avatar_medium_url TEXT,
+      ADD COLUMN IF NOT EXISTS avatar_full_url TEXT,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
+  `);
+
+  await client.query(`
+    ALTER TABLE player_profiles
+      ADD COLUMN IF NOT EXISTS elo_2v2 INTEGER NOT NULL DEFAULT 100,
+      ADD COLUMN IF NOT EXISTS wins_2v2 INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS losses_2v2 INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS matches_played_2v2 INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS last_match_at TIMESTAMPTZ;
+  `);
+
   await client.query(`
     ALTER TABLE parties
       ADD COLUMN IF NOT EXISTS leader_user_id UUID,
@@ -72,188 +135,100 @@ async function repairLegacyPartyTables(client) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_party_members_party_user_unique
       ON party_members(party_id, user_id);
   `);
-}
 
-async function repairLegacyUsers(client) {
   await client.query(`
-    ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS profile_url TEXT,
-      ADD COLUMN IF NOT EXISTS avatar_url TEXT,
-      ADD COLUMN IF NOT EXISTS avatar_medium_url TEXT,
-      ADD COLUMN IF NOT EXISTS avatar_full_url TEXT,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_party_members_user
+      ON party_members(user_id);
   `);
 
   await client.query(`
-    ALTER TABLE player_profiles
-      ADD COLUMN IF NOT EXISTS elo_2v2 INTEGER NOT NULL DEFAULT 100,
-      ADD COLUMN IF NOT EXISTS wins_2v2 INTEGER NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS losses_2v2 INTEGER NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS matches_played_2v2 INTEGER NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      ADD COLUMN IF NOT EXISTS last_match_at TIMESTAMPTZ;
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints
+        WHERE table_name = 'parties'
+          AND constraint_name = 'parties_leader_user_id_fkey'
+      ) THEN
+        ALTER TABLE parties
+          ADD CONSTRAINT parties_leader_user_id_fkey
+          FOREIGN KEY (leader_user_id) REFERENCES users(id) ON DELETE CASCADE;
+      END IF;
+    END $$;
   `);
 }
 
-async function recreateManagedTables(client) {
-  console.log('[db] legacy managed tables detected; recreating matchmaking tables');
+async function needsManagedReset(client, tableName, requiredColumns) {
+  const exists = await tableExists(client, tableName);
+  if (!exists) return false;
 
-  await client.query(`
-    DROP TABLE IF EXISTS match_players CASCADE;
-    DROP TABLE IF EXISTS presence CASCADE;
-    DROP TABLE IF EXISTS matches CASCADE;
-    DROP TABLE IF EXISTS queue_entries CASCADE;
-    DROP TABLE IF EXISTS party_invites CASCADE;
-    DROP TABLE IF EXISTS server_instances CASCADE;
-  `);
+  const columns = await getPublicColumns(client, tableName);
+  const missing = requiredColumns.filter((column) => !columns.includes(column));
+  if (missing.length > 0) {
+    console.warn(`[db] ${tableName} is missing columns: ${missing.join(', ')}`);
+    return true;
+  }
 
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS party_invites (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      party_id UUID NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
-      from_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      to_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '15 minutes'),
-      CONSTRAINT party_invites_status_check CHECK (status IN ('pending','accepted','declined','expired','cancelled'))
-    );
+  if (tableName === 'queue_entries') {
+    const legacyColumns = ['client_id', 'nickname', 'match_id', 'joined_at', 'updated_at', 'last_seen_ms'];
+    const presentLegacy = legacyColumns.filter((column) => columns.includes(column));
+    if (presentLegacy.length > 0) {
+      console.warn(`[db] ${tableName} has legacy columns: ${presentLegacy.join(', ')}`);
+      return true;
+    }
+  }
 
-    CREATE TABLE IF NOT EXISTS presence (
-      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      state TEXT NOT NULL DEFAULT 'offline',
-      current_party_id UUID REFERENCES parties(id) ON DELETE SET NULL,
-      current_match_id UUID,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      CONSTRAINT presence_state_check CHECK (state IN ('online','in_party','searching','in_match','offline'))
-    );
+  if (tableName === 'matches') {
+    const hasPk = await hasPrimaryKeyOnId(client, tableName);
+    if (!hasPk) {
+      console.warn('[db] matches.id is not a primary key; resetting managed tables');
+      return true;
+    }
+  }
 
-    CREATE TABLE IF NOT EXISTS queue_entries (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      party_id UUID NOT NULL UNIQUE REFERENCES parties(id) ON DELETE CASCADE,
-      leader_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      mode TEXT NOT NULL DEFAULT '2x2',
-      status TEXT NOT NULL DEFAULT 'queued',
-      queued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      matched_at TIMESTAMPTZ,
-      CONSTRAINT queue_entries_status_check CHECK (status IN ('queued','matched','cancelled'))
-    );
+  return false;
+}
 
-    CREATE TABLE IF NOT EXISTS matches (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      public_match_id TEXT NOT NULL UNIQUE,
-      mode TEXT NOT NULL DEFAULT '2x2',
-      status TEXT NOT NULL DEFAULT 'pending',
-      server_id TEXT,
-      server_ip TEXT,
-      server_port INTEGER,
-      server_password TEXT,
-      map_name TEXT DEFAULT 'de_dust2',
-      team_a_score INTEGER NOT NULL DEFAULT 0,
-      team_b_score INTEGER NOT NULL DEFAULT 0,
-      winner_team TEXT,
-      result_source TEXT,
-      started_at TIMESTAMPTZ,
-      finished_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      CONSTRAINT matches_status_check CHECK (status IN ('pending','server_assigned','live','finished','cancelled')),
-      CONSTRAINT matches_winner_team_check CHECK (winner_team IN ('A','B') OR winner_team IS NULL)
-    );
+async function dropManagedTables(client) {
+  for (const tableName of RESET_ORDER) {
+    await client.query(`DROP TABLE IF EXISTS ${tableName} CASCADE`);
+  }
+}
 
-    CREATE TABLE IF NOT EXISTS match_players (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      match_id UUID NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      party_id UUID REFERENCES parties(id) ON DELETE SET NULL,
-      team TEXT NOT NULL,
-      slot_index INTEGER NOT NULL,
-      elo_before INTEGER,
-      elo_after INTEGER,
-      elo_delta INTEGER,
-      result TEXT,
-      connected_at TIMESTAMPTZ,
-      UNIQUE (match_id, user_id),
-      CONSTRAINT match_players_team_check CHECK (team IN ('A','B')),
-      CONSTRAINT match_players_result_check CHECK (result IN ('win','loss') OR result IS NULL)
-    );
-
-    CREATE TABLE IF NOT EXISTS server_instances (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      name TEXT NOT NULL,
-      host TEXT NOT NULL,
-      port INTEGER NOT NULL,
-      server_password TEXT,
-      server_token TEXT,
-      status TEXT NOT NULL DEFAULT 'idle',
-      region TEXT NOT NULL DEFAULT 'EU',
-      last_heartbeat_at TIMESTAMPTZ,
-      UNIQUE (host, port),
-      CONSTRAINT server_instances_status_check CHECK (status IN ('idle','reserved','live','offline'))
-    );
-
-    ALTER TABLE presence
-      DROP CONSTRAINT IF EXISTS presence_current_match_fkey;
-
-    ALTER TABLE presence
-      ADD CONSTRAINT presence_current_match_fkey
-      FOREIGN KEY (current_match_id) REFERENCES matches(id) ON DELETE SET NULL;
-
-    CREATE INDEX IF NOT EXISTS idx_party_invites_to_user
-      ON party_invites(to_user_id, status);
-
-    CREATE INDEX IF NOT EXISTS idx_queue_entries_status
-      ON queue_entries(status, queued_at);
-
-    CREATE INDEX IF NOT EXISTS idx_matches_status
-      ON matches(status, created_at DESC);
-
-    CREATE INDEX IF NOT EXISTS idx_match_players_user
-      ON match_players(user_id);
-  `);
+async function applySchema(client) {
+  const schemaPath = path.join(__dirname, '../../sql/schema.sql');
+  const sql = fs.readFileSync(schemaPath, 'utf8');
+  await client.query(sql);
 }
 
 async function initSchema() {
-  const schemaPath = path.join(__dirname, '../../sql/schema.sql');
-  const sql = fs.readFileSync(schemaPath, 'utf8');
-
   const client = await pool.connect();
-
   try {
     await client.query('BEGIN');
+    await client.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
 
-    await client.query(sql);
+    await applySchema(client);
+    await ensureLegacyCoreColumns(client);
 
-    await repairLegacyUsers(client);
-    
-await repairLegacyPartyTables(client);
-    
-    const presenceHasUserId = await columnExists(client, 'presence', 'user_id');
-    const presenceHasState = await columnExists(client, 'presence', 'state');
-    const presenceHasCurrentPartyId = await columnExists(client, 'presence', 'current_party_id');
-    const presenceHasUpdatedAt = await columnExists(client, 'presence', 'updated_at');
+    let shouldResetManagedTables = false;
+    for (const [tableName, requiredColumns] of Object.entries(MANAGED_TABLES)) {
+      if (await needsManagedReset(client, tableName, requiredColumns)) {
+        shouldResetManagedTables = true;
+        break;
+      }
+    }
 
-    if (!presenceHasUserId || !presenceHasState || !presenceHasCurrentPartyId || !presenceHasUpdatedAt) {
-      console.log(
-        `[db] presence is missing columns: ${[
-          !presenceHasUserId ? 'user_id' : null,
-          !presenceHasState ? 'state' : null,
-          !presenceHasCurrentPartyId ? 'current_party_id' : null,
-          !presenceHasUpdatedAt ? 'updated_at' : null
-        ]
-          .filter(Boolean)
-          .join(', ')}`
-      );
-
-      await recreateManagedTables(client);
+    if (shouldResetManagedTables) {
+      console.warn('[db] legacy managed tables detected; recreating matchmaking tables');
+      await dropManagedTables(client);
+      await applySchema(client);
     }
 
     await client.query('COMMIT');
     console.log('[db] schema initialized');
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('[db] schema init failed:', error);
+    console.error('[db] schema initialization failed:', error);
     throw error;
   } finally {
     client.release();
