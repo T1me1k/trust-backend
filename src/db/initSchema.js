@@ -32,6 +32,10 @@ async function repairLegacyUsers(client) {
 
   await client.query(`
     ALTER TABLE player_profiles
+      ADD COLUMN IF NOT EXISTS elo_2v2 INTEGER NOT NULL DEFAULT 100,
+      ADD COLUMN IF NOT EXISTS wins_2v2 INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS losses_2v2 INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS matches_played_2v2 INTEGER NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       ADD COLUMN IF NOT EXISTS last_match_at TIMESTAMPTZ;
   `);
