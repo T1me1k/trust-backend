@@ -1,5 +1,5 @@
 const express = require('express');
-const { query } = require('../../db');
+const { query, withTransaction } = require('../db');
 const { ok, fail } = require('../../utils/http');
 const { submitMatchResult } = require('../../services/matchService');
 
