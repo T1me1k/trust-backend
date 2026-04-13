@@ -32,9 +32,7 @@ router.get('/me', async (req, res) => {
         wins2v2: Number(account.wins_2v2 || 0),
         losses2v2: Number(account.losses_2v2 || 0),
         matchesPlayed2v2: Number(account.matches_played_2v2 || 0),
-        presence: account.presence || 'online',
-        restriction: account.restriction_state?.restriction || null,
-        canQueue: account.restriction_state?.canQueue !== false
+        presence: account.presence || 'online'
       }
     });
   } catch (err) {

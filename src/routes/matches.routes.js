@@ -3,6 +3,7 @@ const { requireAuth } = require('../middleware/auth');
 const { ok, fail } = require('../utils/http');
 const {
   getCurrentMatchByUserId,
+  getMatchRoomByPublicId,
   getMatchHistory,
   acceptCurrentMatch,
   submitMapVote,
@@ -20,6 +21,12 @@ router.get('/me/current', async (req, res) => {
 router.get('/me/history', async (req, res) => {
   const items = await getMatchHistory(req.session.userId, Number(req.query.limit || 8));
   return ok(res, { items });
+});
+
+
+router.get('/:publicMatchId/room', async (req, res) => {
+  const room = await getMatchRoomByPublicId(req.session.userId, req.params.publicMatchId);
+  return ok(res, { room, mapPool: MAP_POOL });
 });
 
 router.post('/:publicMatchId/accept', async (req, res) => {

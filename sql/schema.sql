@@ -104,12 +104,12 @@ CREATE TABLE IF NOT EXISTS matches (
   server_port INTEGER,
   server_password TEXT,
   map_name TEXT,
-  accept_expires_at TIMESTAMPTZ,
-  connect_expires_at TIMESTAMPTZ,
   accepted_at TIMESTAMPTZ,
+  accept_expires_at TIMESTAMPTZ,
   map_voting_started_at TIMESTAMPTZ,
   map_voting_finished_at TIMESTAMPTZ,
   selected_map_by TEXT,
+  connect_expires_at TIMESTAMPTZ,
   team_a_score INTEGER NOT NULL DEFAULT 0,
   team_b_score INTEGER NOT NULL DEFAULT 0,
   winner_team TEXT,
@@ -131,19 +131,18 @@ CREATE TABLE IF NOT EXISTS match_players (
   accepted_at TIMESTAMPTZ,
   map_vote TEXT,
   map_vote_at TIMESTAMPTZ,
+  connection_state TEXT NOT NULL DEFAULT 'waiting_connect',
+  reconnect_expires_at TIMESTAMPTZ,
+  abandoned_at TIMESTAMPTZ,
   elo_before INTEGER,
   elo_after INTEGER,
   elo_delta INTEGER,
   result TEXT,
   connected_at TIMESTAMPTZ,
-  disconnected_at TIMESTAMPTZ,
-  reconnect_expires_at TIMESTAMPTZ,
-  abandoned_at TIMESTAMPTZ,
-  connection_state TEXT NOT NULL DEFAULT 'pending',
   UNIQUE (match_id, user_id),
   CONSTRAINT match_players_team_check CHECK (team IN ('A','B')),
-  CONSTRAINT match_players_connection_state_check CHECK (connection_state IN ('pending','connected','disconnected','abandoned')),
-  CONSTRAINT match_players_result_check CHECK (result IN ('win','loss') OR result IS NULL)
+  CONSTRAINT match_players_result_check CHECK (result IN ('win','loss') OR result IS NULL),
+  CONSTRAINT match_players_connection_state_check CHECK (connection_state IN ('waiting_connect','connected','disconnected','abandoned'))
 );
 
 CREATE TABLE IF NOT EXISTS server_instances (
@@ -169,40 +168,3 @@ CREATE INDEX IF NOT EXISTS idx_match_players_user ON match_players(user_id);
 
 ALTER TABLE presence DROP CONSTRAINT IF EXISTS presence_current_match_fkey;
 ALTER TABLE presence ADD CONSTRAINT presence_current_match_fkey FOREIGN KEY (current_match_id) REFERENCES matches(id) ON DELETE SET NULL;
-
-
-CREATE TABLE IF NOT EXISTS player_restrictions (
-  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  penalty_type TEXT NOT NULL,
-  lock_category TEXT NOT NULL DEFAULT 'cooldown',
-  reason_key TEXT NOT NULL,
-  reason_title TEXT NOT NULL,
-  reason_message TEXT NOT NULL,
-  source TEXT NOT NULL DEFAULT 'system',
-  locked_until TIMESTAMPTZ NOT NULL,
-  active_match_id UUID REFERENCES matches(id) ON DELETE SET NULL,
-  active_match_player_id UUID REFERENCES match_players(id) ON DELETE SET NULL,
-  metadata JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS player_restriction_events (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  penalty_type TEXT NOT NULL,
-  lock_category TEXT NOT NULL DEFAULT 'cooldown',
-  reason_key TEXT NOT NULL,
-  reason_title TEXT NOT NULL,
-  reason_message TEXT NOT NULL,
-  source TEXT NOT NULL DEFAULT 'system',
-  duration_seconds INTEGER NOT NULL,
-  locked_until TIMESTAMPTZ NOT NULL,
-  match_id UUID REFERENCES matches(id) ON DELETE SET NULL,
-  match_player_id UUID REFERENCES match_players(id) ON DELETE SET NULL,
-  metadata JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_player_restrictions_locked_until ON player_restrictions(locked_until);
-CREATE INDEX IF NOT EXISTS idx_player_restriction_events_user_created ON player_restriction_events(user_id, created_at DESC);
