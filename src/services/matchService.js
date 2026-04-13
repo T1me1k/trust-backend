@@ -161,22 +161,22 @@ function buildRoomSummary(match, players, myUserId) {
 
 async function getCurrentMatchByUserId(userId) {
   const result = await query(
-    `SELECT m.id, m.public_match_id, m.mode, m.status, m.map_name, m.server_ip, m.server_port, m.server_password,
-            m.team_a_score, m.team_b_score, m.winner_team, m.server_id,
-            si.name AS server_name, si.region AS server_region,
-            m.accepted_at, m.accept_expires_at, m.map_voting_started_at, m.map_voting_finished_at,
-            m.connect_expires_at, m.started_at, m.finished_at,
-            mp.team, mp.accepted_at AS player_accepted_at, mp.map_vote AS player_map_vote,
-            mp.connected_at AS player_connected_at, mp.connection_state AS player_connection_state,
-            mp.reconnect_expires_at AS player_reconnect_expires_at, mp.abandoned_at AS player_abandoned_at
-     FROM match_players mp
-     JOIN matches m ON m.id = mp.match_id
-     LEFT JOIN server_instances si ON si.id = m.server_id
-     WHERE mp.user_id = $1 AND m.status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live', 'finished')
-     ORDER BY COALESCE(m.finished_at, m.created_at) DESC
-     LIMIT 1`,
-    [userId]
-  );
+  `SELECT m.id, m.public_match_id, m.mode, m.status, m.map_name, m.server_ip, m.server_port, m.server_password,
+          m.team_a_score, m.team_b_score, m.winner_team, m.server_id,
+          si.name AS server_name, si.region AS server_region,
+          m.accepted_at, m.accept_expires_at, m.map_voting_started_at, m.map_voting_finished_at,
+          m.connect_expires_at, m.started_at, m.finished_at,
+          mp.team, mp.accepted_at AS player_accepted_at, mp.map_vote AS player_map_vote,
+          mp.connected_at AS player_connected_at, mp.connection_state AS player_connection_state,
+          mp.reconnect_expires_at AS player_reconnect_expires_at, mp.abandoned_at AS player_abandoned_at
+   FROM match_players mp
+   JOIN matches m ON m.id = mp.match_id
+   LEFT JOIN server_instances si ON si.id::text = m.server_id
+   WHERE mp.user_id = $1 AND m.status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live', 'finished')
+   ORDER BY COALESCE(m.finished_at, m.created_at) DESC
+   LIMIT 1`,
+  [userId]
+);
   const match = result.rows[0] || null;
   if (!match) return null;
 
