@@ -1,7 +1,7 @@
 const express = require('express');
 const { query, withTransaction } = require('../db');
 const { ok, fail } = require('../utils/http');
-const { submitMatchResult } = require('../services/matchService');
+const { submitMatchResult, markPlayerConnected, markPlayerDisconnected } = require('../services/matchService');
 
 const router = express.Router();
 
@@ -159,6 +159,29 @@ router.get('/server/result-config-text', async (req, res) => {
       .send(`active=1\nmatch_id=${match.public_match_id}\nmap=${mapLabelToServerMap(match.map_name)}\n`);
   } catch (err) {
     return fail(res, 400, err.message || 'result_config_failed');
+  }
+});
+
+
+router.post('/server/player-connected', async (req, res) => {
+  try {
+    const { matchId, steamId } = req.body || {};
+    if (!matchId || !steamId) return fail(res, 400, 'missing_fields');
+    const result = await markPlayerConnected({ publicMatchId: String(matchId), steamId: String(steamId) });
+    return ok(res, result);
+  } catch (err) {
+    return fail(res, 400, err.message || 'player_connected_failed');
+  }
+});
+
+router.post('/server/player-disconnected', async (req, res) => {
+  try {
+    const { matchId, steamId } = req.body || {};
+    if (!matchId || !steamId) return fail(res, 400, 'missing_fields');
+    const result = await markPlayerDisconnected({ publicMatchId: String(matchId), steamId: String(steamId) });
+    return ok(res, result);
+  } catch (err) {
+    return fail(res, 400, err.message || 'player_disconnected_failed');
   }
 });
 

@@ -1,3 +1,4 @@
+const { getRestrictionState } = require('./restrictionsService');
 const { query } = require('../db');
 
 async function ensurePlayerProfile(userId) {
@@ -63,7 +64,10 @@ async function getAccountByUserId(userId) {
     [userId]
   );
 
-  return result.rows[0] || null;
+  const account = result.rows[0] || null;
+  if (!account) return null;
+  const restrictionState = await getRestrictionState(userId);
+  return { ...account, restriction_state: restrictionState };
 }
 
 async function searchUsersByNickname(q) {

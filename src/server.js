@@ -9,6 +9,7 @@ const config = require('../src/config');
 const { pool } = require('../src/db');
 const { initSchema } = require('../src/db/initSchema');
 const { runMatchmakingCycle } = require('../src/services/queueService');
+const { processMatchLifecycleCycle } = require('../src/services/matchService');
 
 const authRoutes = require('../src/routes/auth.routes');
 const accountRoutes = require('../src/routes/account.routes');
@@ -87,7 +88,12 @@ function setupRoutes() {
 async function runMatchmakingTick() {
   if (matchmakingRunning || shuttingDown) return;
   matchmakingRunning = true;
-  try { await runMatchmakingCycle(); } catch (e) { console.error('matchmaking cycle error:', e); } finally { matchmakingRunning = false; }
+  try {
+    await processMatchLifecycleCycle();
+    await runMatchmakingCycle();
+  } catch (e) {
+    console.error('matchmaking cycle error:', e);
+  } finally { matchmakingRunning = false; }
 }
 
 function startMatchmakingLoop() {

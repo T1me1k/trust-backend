@@ -144,14 +144,20 @@ async function repairMatchmakingTables(client) {
       ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS map_voting_started_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS map_voting_finished_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS selected_map_by TEXT;
+      ADD COLUMN IF NOT EXISTS selected_map_by TEXT,
+      ADD COLUMN IF NOT EXISTS accept_expires_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS connect_expires_at TIMESTAMPTZ;
   `);
 
   await client.query(`
     ALTER TABLE match_players
       ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS map_vote TEXT,
-      ADD COLUMN IF NOT EXISTS map_vote_at TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS map_vote_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS disconnected_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS reconnect_expires_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS abandoned_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS connection_state TEXT NOT NULL DEFAULT 'pending';
   `);
 
   await client.query(`
@@ -170,7 +176,56 @@ async function repairMatchmakingTables(client) {
         ALTER TABLE matches ADD CONSTRAINT matches_status_check
           CHECK (status IN ('pending','pending_acceptance','map_voting','server_assigned','live','finished','cancelled'));
       END IF;
+
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='match_players' AND column_name='connection_state'
+      ) THEN
+        ALTER TABLE match_players DROP CONSTRAINT IF EXISTS match_players_connection_state_check;
+        ALTER TABLE match_players ADD CONSTRAINT match_players_connection_state_check
+          CHECK (connection_state IN ('pending','connected','disconnected','abandoned'));
+      END IF;
     END $$;
+  `);
+}
+
+async function repairRestrictionTables(client) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS player_restrictions (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      penalty_type TEXT NOT NULL,
+      lock_category TEXT NOT NULL DEFAULT 'cooldown',
+      reason_key TEXT NOT NULL,
+      reason_title TEXT NOT NULL,
+      reason_message TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'system',
+      locked_until TIMESTAMPTZ NOT NULL,
+      active_match_id UUID REFERENCES matches(id) ON DELETE SET NULL,
+      active_match_player_id UUID REFERENCES match_players(id) ON DELETE SET NULL,
+      metadata JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS player_restriction_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      penalty_type TEXT NOT NULL,
+      lock_category TEXT NOT NULL DEFAULT 'cooldown',
+      reason_key TEXT NOT NULL,
+      reason_title TEXT NOT NULL,
+      reason_message TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'system',
+      duration_seconds INTEGER NOT NULL,
+      locked_until TIMESTAMPTZ NOT NULL,
+      match_id UUID REFERENCES matches(id) ON DELETE SET NULL,
+      match_player_id UUID REFERENCES match_players(id) ON DELETE SET NULL,
+      metadata JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_player_restrictions_locked_until ON player_restrictions(locked_until);
+    CREATE INDEX IF NOT EXISTS idx_player_restriction_events_user_created ON player_restriction_events(user_id, created_at DESC);
   `);
 }
 
@@ -184,6 +239,7 @@ async function initSchema() {
     await repairLegacyPartyTables(client);
     await applyBaseSchema(client);
     await repairMatchmakingTables(client);
+    await repairRestrictionTables(client);
     await client.query('COMMIT');
     console.log('[db] schema initialized');
   } catch (error) {

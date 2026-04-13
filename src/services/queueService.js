@@ -3,6 +3,7 @@ const config = require('../config');
 const { query, withTransaction } = require('../db');
 const { createParty, getCurrentPartyByUserId } = require('./partyService');
 const { setPresence } = require('./accountService');
+const { assertCanQueue, getRestrictionState } = require('./restrictionsService');
 
 function newPublicMatchId() {
   return 'match_' + crypto.randomBytes(8).toString('hex');
@@ -22,6 +23,7 @@ function normalizeQueueRow(row) {
 }
 
 async function getQueueState(userId) {
+  const restrictionState = await getRestrictionState(userId);
   const result = await query(
     `SELECT qe.*
      FROM party_members pm
@@ -30,7 +32,8 @@ async function getQueueState(userId) {
      LIMIT 1`,
     [userId]
   );
-  return normalizeQueueRow(result.rows[0] || null);
+  const queue = normalizeQueueRow(result.rows[0] || null);
+  return { queue, restriction: restrictionState.restriction, canQueue: restrictionState.canQueue };
 }
 
 async function getPartyForQueue(userId) {
@@ -46,6 +49,18 @@ async function joinQueue(userId) {
   if (party.status !== 'open') throw new Error('party_not_open');
   const memberCount = party.members.length;
   if (memberCount < 1 || memberCount > 2) throw new Error('party_size_invalid');
+  for (const member of party.members) {
+    try {
+      await assertCanQueue(member.userId);
+    } catch (error) {
+      if (member.userId !== userId) {
+        const err = new Error('party_member_queue_locked');
+        err.cause = error;
+        throw err;
+      }
+      throw error;
+    }
+  }
 
   await withTransaction(async (client) => {
     await client.query(
@@ -211,10 +226,10 @@ async function createMatchFromSelection(selectedEntries) {
   const match = await withTransaction(async (client) => {
     await client.query(`UPDATE server_instances SET status = 'reserved', last_heartbeat_at = NOW() WHERE id = $1`, [server.id]);
     const matchResult = await client.query(
-      `INSERT INTO matches (public_match_id, mode, status, server_id, server_ip, server_port, server_password, map_name, created_at)
-       VALUES ($1, '2x2', 'pending_acceptance', $2, $3, $4, $5, NULL, NOW())
+      `INSERT INTO matches (public_match_id, mode, status, server_id, server_ip, server_port, server_password, map_name, accept_expires_at, created_at)
+       VALUES ($1, '2x2', 'pending_acceptance', $2, $3, $4, $5, NULL, NOW() + ($6 * INTERVAL '1 second'), NOW())
        RETURNING *`,
-      [publicMatchId, server.id, server.host, server.port, server.server_password]
+      [publicMatchId, server.id, server.host, server.port, server.server_password, config.acceptTimeoutSeconds]
     );
     const row = matchResult.rows[0];
 

@@ -7,14 +7,14 @@ const router = express.Router();
 router.use(requireAuth);
 
 router.get('/me', async (req, res) => {
-  const queue = await getQueueState(req.session.userId);
-  return ok(res, { queue });
+  const state = await getQueueState(req.session.userId);
+  return ok(res, state);
 });
 
 router.post('/join', async (req, res) => {
   try {
-    const queue = await joinQueue(req.session.userId, req.body.mode || '2x2');
-    return ok(res, { queue });
+    const state = await joinQueue(req.session.userId, req.body.mode || '2x2');
+    return ok(res, state);
   } catch (err) {
     return fail(res, 400, err.message || 'queue_join_failed');
   }
