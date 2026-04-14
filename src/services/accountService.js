@@ -66,21 +66,40 @@ async function getAccountByUserId(userId) {
   return result.rows[0] || null;
 }
 
-async function searchUsersByNickname(q) {
+async function searchUsersByNickname(q, currentUserId = null) {
+  const params = [`%${q}%`];
+  let exclusionSql = '';
+  if (currentUserId) {
+    params.push(currentUserId);
+    exclusionSql = ` AND u.id <> $${params.length}`;
+  }
+
   const result = await query(
     `SELECT
         u.id,
         u.steam_id,
         u.persona_name,
         u.avatar_full_url,
-        COALESCE(p.elo_2v2, 100) AS elo_2v2
+        COALESCE(p.elo_2v2, 100) AS elo_2v2,
+        COALESCE(pr.state, 'online') AS presence_state,
+        ap.status AS party_status
      FROM users u
      LEFT JOIN player_profiles p
        ON p.user_id = u.id
-     WHERE LOWER(u.persona_name) LIKE LOWER($1)
+     LEFT JOIN presence pr
+       ON pr.user_id = u.id
+     LEFT JOIN LATERAL (
+       SELECT p2.status
+       FROM party_members pm2
+       JOIN parties p2 ON p2.id = pm2.party_id
+       WHERE pm2.user_id = u.id AND p2.status <> 'closed'
+       ORDER BY p2.created_at DESC
+       LIMIT 1
+     ) ap ON TRUE
+     WHERE LOWER(u.persona_name) LIKE LOWER($1)${exclusionSql}
      ORDER BY u.persona_name ASC
      LIMIT 10`,
-    [`%${q}%`]
+    params
   );
 
   return result.rows;

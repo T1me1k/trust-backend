@@ -44,7 +44,7 @@ router.get('/me/stats', requireAuth, async (req, res) => {
 router.get('/users/search', requireAuth, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return fail(res, 400, 'missing_query');
-  const items = await searchUsersByNickname(q);
+  const items = await searchUsersByNickname(q, req.session.userId);
   return ok(res, {
     items: items.map((item) => ({
       id: item.id,
@@ -52,7 +52,10 @@ router.get('/users/search', requireAuth, async (req, res) => {
       steamId64: item.steam_id,
       nickname: item.persona_name,
       avatarUrl: item.avatar_full_url || null,
-      elo2v2: Number(item.elo_2v2 || 100)
+      elo2v2: Number(item.elo_2v2 || 100),
+      partyStatus: item.party_status || null,
+      presence: item.presence_state || 'online',
+      presenceLabel: item.presence_state === 'searching' ? 'Уже ищет матч' : item.party_status ? 'Уже в lobby' : 'Онлайн'
     }))
   });
 });

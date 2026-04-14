@@ -38,9 +38,9 @@ router.post('/invite', async (req, res) => {
 
 router.post('/invite/:id/accept', async (req, res) => {
   try {
-    const partyId = await acceptInvite(req.params.id, req.session.userId);
-    await setPresence(req.session.userId, 'in_party', partyId, null);
-    return ok(res, { accepted: true });
+    const result = await acceptInvite(req.params.id, req.session.userId);
+    await setPresence(req.session.userId, 'in_party', result.partyId, null);
+    return ok(res, { accepted: true, replacedLobby: (result.replacedMemberIds || []).length > 0 });
   } catch (err) {
     return fail(res, 400, err.message || 'accept_failed');
   }

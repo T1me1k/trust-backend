@@ -30,6 +30,36 @@ function normalizeInvite(row) {
   };
 }
 
+async function disbandPartyById(client, partyId, reason = 'closed') {
+  const membersResult = await client.query(`SELECT user_id FROM party_members WHERE party_id = $1`, [partyId]);
+  const memberIds = membersResult.rows.map((row) => row.user_id);
+
+  await client.query(`UPDATE parties SET status = 'closed', updated_at = NOW() WHERE id = $1`, [partyId]);
+  await client.query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status = 'queued'`, [partyId]);
+  await client.query(`UPDATE party_invites SET status = $2 WHERE party_id = $1 AND status = 'pending'`, [partyId, reason === 'replaced' ? 'cancelled' : 'cancelled']);
+  await client.query(`DELETE FROM party_members WHERE party_id = $1`, [partyId]);
+
+  return memberIds;
+}
+
+async function closeActivePartyForUser(client, userId) {
+  const activePartyResult = await client.query(
+    `SELECT p.id, p.status
+     FROM party_members pm
+     JOIN parties p ON p.id = pm.party_id
+     WHERE pm.user_id = $1
+       AND p.status <> 'closed'
+     ORDER BY p.created_at DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [userId]
+  );
+
+  const activeParty = activePartyResult.rows[0];
+  if (!activeParty) return [];
+  return disbandPartyById(client, activeParty.id, 'replaced');
+}
+
 async function getIncomingInvitesByUserId(userId) {
   const result = await query(
     `SELECT pi.*, u.persona_name AS from_nickname, u.avatar_full_url AS from_avatar_url
@@ -139,7 +169,7 @@ async function inviteToParty({ actorUserId, targetUserId }) {
   if ((party.members || []).length >= 2) throw new Error('party_full');
 
   const targetParty = await getCurrentPartyByUserId(targetUserId);
-  if (targetParty?.id) throw new Error('target_already_in_party');
+  if (targetParty?.id && targetParty.status === 'in_match') throw new Error('target_in_match');
 
   const existingInvite = await query(
     `SELECT id
@@ -152,7 +182,7 @@ async function inviteToParty({ actorUserId, targetUserId }) {
 
   const result = await query(
     `INSERT INTO party_invites (party_id, from_user_id, to_user_id, status, created_at, expires_at)
-     VALUES ($1, $2, $3, 'pending', NOW(), NOW() + INTERVAL '15 minutes')
+     VALUES ($1, $2, $3, 'pending', NOW(), NOW() + INTERVAL '10 seconds')
      RETURNING *`,
     [party.id, actorUserId, targetUserId]
   );
@@ -160,7 +190,7 @@ async function inviteToParty({ actorUserId, targetUserId }) {
 }
 
 async function acceptInvite(inviteId, userId) {
-  return withTransaction(async (client) => {
+  const result = await withTransaction(async (client) => {
     const inviteResult = await client.query(
       `SELECT *
        FROM party_invites
@@ -176,16 +206,7 @@ async function acceptInvite(inviteId, userId) {
     if (invite.status !== 'pending') throw new Error('invite_not_pending');
     if (new Date(invite.expires_at) < new Date()) throw new Error('invite_expired');
 
-    const activeParty = await client.query(
-      `SELECT pm.party_id
-       FROM party_members pm
-       JOIN parties p ON p.id = pm.party_id
-       WHERE pm.user_id = $1
-         AND p.status <> 'closed'
-       LIMIT 1`,
-      [userId]
-    );
-    if (activeParty.rows[0]) throw new Error('already_in_party');
+    const replacedMemberIds = await closeActivePartyForUser(client, userId);
 
     const membersCount = await client.query(`SELECT COUNT(*)::int AS c FROM party_members WHERE party_id = $1`, [invite.party_id]);
     if (membersCount.rows[0].c >= 2) throw new Error('party_full');
@@ -197,8 +218,14 @@ async function acceptInvite(inviteId, userId) {
       [invite.party_id, userId]
     );
 
-    return invite.party_id;
+    return { partyId: invite.party_id, replacedMemberIds };
   });
+
+  for (const memberId of result.replacedMemberIds || []) {
+    if (memberId !== userId) await setPresence(memberId, 'online', null, null);
+  }
+
+  return result;
 }
 
 async function declineInvite(inviteId, userId) {
