@@ -142,11 +142,11 @@ async function repairMatchmakingTables(client) {
   await client.query(`
     ALTER TABLE matches
       ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS accept_expires_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS map_voting_started_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS map_voting_finished_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS selected_map_by TEXT,
-      ADD COLUMN IF NOT EXISTS connect_expires_at TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
   `);
 
   await client.query(`
@@ -154,14 +154,17 @@ async function repairMatchmakingTables(client) {
       ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS map_vote TEXT,
       ADD COLUMN IF NOT EXISTS map_vote_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS connection_state TEXT NOT NULL DEFAULT 'waiting_connect',
+      ADD COLUMN IF NOT EXISTS joined_server_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS disconnected_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS reconnect_expires_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS abandoned_at TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS abandoned_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS connection_state TEXT NOT NULL DEFAULT 'pending_connect';
   `);
 
   await client.query(`
     CREATE INDEX IF NOT EXISTS idx_match_players_match_id ON match_players(match_id);
     CREATE INDEX IF NOT EXISTS idx_queue_entries_status ON queue_entries(status, queued_at);
+    CREATE INDEX IF NOT EXISTS idx_match_players_connection_state ON match_players(match_id, connection_state);
   `);
 
   await client.query(`
@@ -174,6 +177,20 @@ async function repairMatchmakingTables(client) {
         ALTER TABLE matches DROP CONSTRAINT IF EXISTS matches_status_check;
         ALTER TABLE matches ADD CONSTRAINT matches_status_check
           CHECK (status IN ('pending','pending_acceptance','map_voting','server_assigned','live','finished','cancelled'));
+      END IF;
+    END $$;
+  `);
+
+  await client.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='match_players' AND column_name='connection_state'
+      ) THEN
+        ALTER TABLE match_players DROP CONSTRAINT IF EXISTS match_players_connection_state_check;
+        ALTER TABLE match_players ADD CONSTRAINT match_players_connection_state_check
+          CHECK (connection_state IN ('pending_connect','connected','disconnected','abandoned'));
       END IF;
     END $$;
   `);

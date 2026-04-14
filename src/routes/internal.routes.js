@@ -4,6 +4,7 @@ const { ok, fail } = require('../utils/http');
 const { submitMatchResult } = require('../services/matchService');
 
 const router = express.Router();
+const RECONNECT_GRACE_SECONDS = Number(process.env.RECONNECT_GRACE_SECONDS || 90);
 
 async function getServerByToken(token) {
   if (!token) return null;
@@ -32,7 +33,12 @@ async function getMatchPlayers(matchId) {
     `SELECT u.steam_id,
             u.persona_name,
             mp.team,
-            mp.slot_index
+            mp.slot_index,
+            mp.connection_state,
+            mp.joined_server_at,
+            mp.disconnected_at,
+            mp.reconnect_expires_at,
+            mp.abandoned_at
      FROM match_players mp
      JOIN users u ON u.id = mp.user_id
      WHERE mp.match_id = $1
@@ -69,6 +75,7 @@ function buildConfigText(match, players) {
   lines.push('active=1');
   lines.push(`match_id=${match.public_match_id}`);
   lines.push(`map=${mapLabelToServerMap(match.map_name)}`);
+  lines.push(`status=${match.status}`);
   lines.push('team_a_name=Team A');
   lines.push('team_b_name=Team B');
 
@@ -77,6 +84,28 @@ function buildConfigText(match, players) {
   }
 
   return `${lines.join('\n')}\n`;
+}
+
+async function expireReconnectsForServer(serverId) {
+  const result = await query(
+    `UPDATE match_players mp
+       SET connection_state = 'abandoned',
+           abandoned_at = COALESCE(abandoned_at, NOW())
+     FROM matches m
+     WHERE m.id = mp.match_id
+       AND m.server_id = $1
+       AND m.status = 'live'
+       AND mp.connection_state = 'disconnected'
+       AND mp.reconnect_expires_at IS NOT NULL
+       AND mp.reconnect_expires_at <= NOW()
+       AND mp.abandoned_at IS NULL
+     RETURNING mp.match_id, mp.user_id`,
+    [serverId]
+  );
+
+  if (result.rowCount > 0) {
+    console.log(`[server-sync] marked ${result.rowCount} disconnected player(s) as abandoned on server ${serverId}`);
+  }
 }
 
 router.use(async (req, res, next) => {
@@ -101,6 +130,8 @@ router.get('/server/heartbeat-simple', async (req, res) => {
        WHERE id = $1`,
       [req.trustServer.id, status]
     );
+
+    await expireReconnectsForServer(req.trustServer.id);
     return ok(res, { heartbeat: true });
   } catch (err) {
     return fail(res, 400, err.message || 'heartbeat_failed');
@@ -109,6 +140,7 @@ router.get('/server/heartbeat-simple', async (req, res) => {
 
 router.get('/server/match-config-text', async (req, res) => {
   try {
+    await expireReconnectsForServer(req.trustServer.id);
     const match = await getActiveMatchForServer(req.trustServer.id);
     if (!match) {
       res.type('text/plain').send('active=0\n');
@@ -141,9 +173,121 @@ router.get('/server/match-ready-simple', async (req, res) => {
       [req.trustServer.id]
     );
 
+    console.log(`[server-sync] match-ready acknowledged for ${String(matchId)} on server ${req.trustServer.name}`);
     return ok(res, { ready: true });
   } catch (err) {
     return fail(res, 400, err.message || 'match_ready_failed');
+  }
+});
+
+router.post('/server/player-connected', async (req, res) => {
+  try {
+    const { matchId, steamId } = req.body || {};
+    if (!matchId || !steamId) return fail(res, 400, 'missing_fields');
+
+    const result = await withTransaction(async (client) => {
+      const matchRes = await client.query(
+        `SELECT id, public_match_id, status
+         FROM matches
+         WHERE public_match_id = $1 AND server_id = $2
+         LIMIT 1
+         FOR UPDATE`,
+        [String(matchId), req.trustServer.id]
+      );
+      const match = matchRes.rows[0];
+      if (!match) throw new Error('match_not_found');
+
+      const updateRes = await client.query(
+        `UPDATE match_players mp
+           SET joined_server_at = COALESCE(joined_server_at, NOW()),
+               disconnected_at = NULL,
+               reconnect_expires_at = NULL,
+               abandoned_at = CASE WHEN mp.connection_state = 'abandoned' THEN NULL ELSE mp.abandoned_at END,
+               connection_state = 'connected'
+         FROM users u
+         WHERE u.id = mp.user_id
+           AND mp.match_id = $1
+           AND u.steam_id = $2
+         RETURNING mp.user_id`,
+        [match.id, String(steamId)]
+      );
+
+      if (!updateRes.rows[0]) throw new Error('player_not_in_match');
+
+      const connectedRes = await client.query(
+        `SELECT COUNT(*) FILTER (WHERE connection_state = 'connected')::int AS connected_count,
+                COUNT(*)::int AS total_count
+         FROM match_players
+         WHERE match_id = $1`,
+        [match.id]
+      );
+      const connectedCount = connectedRes.rows[0].connected_count;
+      const totalCount = connectedRes.rows[0].total_count;
+
+      if (connectedCount === totalCount && match.status !== 'finished') {
+        await client.query(
+          `UPDATE matches
+           SET status = 'live', started_at = COALESCE(started_at, NOW())
+           WHERE id = $1`,
+          [match.id]
+        );
+        await client.query(
+          `UPDATE server_instances
+           SET status = 'live', last_heartbeat_at = NOW()
+           WHERE id = $1`,
+          [req.trustServer.id]
+        );
+      }
+
+      return { connectedCount, totalCount };
+    });
+
+    console.log(`[server-sync] player connected for ${matchId}: ${steamId} (${result.connectedCount}/${result.totalCount})`);
+    return ok(res, result);
+  } catch (err) {
+    return fail(res, 400, err.message || 'player_connected_failed');
+  }
+});
+
+router.post('/server/player-disconnected', async (req, res) => {
+  try {
+    const { matchId, steamId } = req.body || {};
+    if (!matchId || !steamId) return fail(res, 400, 'missing_fields');
+
+    const result = await withTransaction(async (client) => {
+      const matchRes = await client.query(
+        `SELECT id, public_match_id, status
+         FROM matches
+         WHERE public_match_id = $1 AND server_id = $2
+         LIMIT 1
+         FOR UPDATE`,
+        [String(matchId), req.trustServer.id]
+      );
+      const match = matchRes.rows[0];
+      if (!match) throw new Error('match_not_found');
+      if (match.status === 'finished') throw new Error('match_already_finished');
+
+      const updateRes = await client.query(
+        `UPDATE match_players mp
+           SET disconnected_at = NOW(),
+               reconnect_expires_at = NOW() + make_interval(secs => $3::int),
+               connection_state = 'disconnected'
+         FROM users u
+         WHERE u.id = mp.user_id
+           AND mp.match_id = $1
+           AND u.steam_id = $2
+         RETURNING mp.user_id, mp.reconnect_expires_at`,
+        [match.id, String(steamId), RECONNECT_GRACE_SECONDS]
+      );
+
+      if (!updateRes.rows[0]) throw new Error('player_not_in_match');
+      return { reconnectGraceSeconds: RECONNECT_GRACE_SECONDS, reconnectExpiresAt: updateRes.rows[0].reconnect_expires_at };
+    });
+
+    console.log(`[server-sync] player disconnected for ${matchId}: ${steamId} (grace ${RECONNECT_GRACE_SECONDS}s)`);
+    return ok(res, result);
+  } catch (err) {
+    return fail(res, 400, err.message || 'player_disconnected_failed');
   }
 });
 
@@ -174,6 +318,7 @@ router.post('/server/result', async (req, res) => {
       mapName: map || null,
       resultSource: 'server_plugin'
     });
+    console.log(`[server-sync] result submitted for ${matchId}: ${winnerTeam} ${teamAScore}-${teamBScore}`);
     return ok(res, result);
   } catch (err) {
     return fail(res, 400, err.message || 'result_submit_failed');
