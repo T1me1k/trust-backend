@@ -1,5 +1,6 @@
 const { query } = require('../db');
 const { ensurePlayerProfile } = require('./accountService');
+const { getRankForElo } = require('./rankService');
 
 function buildStreaks(resultsAsc) {
   let bestWin = 0;
@@ -88,6 +89,7 @@ async function getProfileSummaryByUserId(userId) {
 
   const favoriteMap = favoriteMapResult.rows[0] || null;
   const wins = Number(base.wins_2v2 || 0);
+  const elo2v2 = Number(base.elo_2v2 || 100);
   const losses = Number(base.losses_2v2 || 0);
   const matchesPlayed = Number(base.matches_played_2v2 || 0);
   const completedMatches = wins + losses;
@@ -100,7 +102,8 @@ async function getProfileSummaryByUserId(userId) {
     nickname: base.persona_name,
     avatarUrl: base.avatar_full_url || base.avatar_medium_url || base.avatar_url || null,
     profileUrl: base.profile_url || null,
-    elo2v2: Number(base.elo_2v2 || 100),
+    elo2v2,
+    rank: getRankForElo(elo2v2),
     wins2v2: wins,
     losses2v2: losses,
     matchesPlayed2v2: matchesPlayed,
@@ -178,7 +181,8 @@ async function getProfileHistoryByUserId(userId, limit = 12) {
       result: row.result,
       nickname: row.persona_name,
       avatarUrl: row.avatar_full_url || null,
-      elo2v2: Number(row.elo_2v2 || 100)
+      elo2v2: Number(row.elo_2v2 || 100),
+      rank: getRankForElo(Number(row.elo_2v2 || 100))
     });
     byMatch.set(row.match_id, list);
   }
@@ -249,6 +253,7 @@ async function getMatchDetailsForUser({ publicMatchId, viewerUserId }) {
     nickname: row.persona_name,
     avatarUrl: row.avatar_full_url || null,
     elo2v2: Number(row.elo_2v2 || 100),
+    rank: getRankForElo(Number(row.elo_2v2 || 100)),
     accepted: !!row.accepted_at,
     mapVote: row.map_vote || null,
     eloBefore: row.elo_before == null ? null : Number(row.elo_before),

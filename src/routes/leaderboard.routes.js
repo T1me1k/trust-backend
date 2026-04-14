@@ -1,6 +1,7 @@
 const express = require('express');
 const { ok } = require('../utils/http');
 const { query } = require('../db');
+const { getRankForElo } = require('../services/rankService');
 
 const router = express.Router();
 
@@ -16,13 +17,14 @@ router.get('/', async (req, res) => {
 
   return ok(res, {
     items: itemsResult.rows.map((row) => ({
-      rank: Number(row.rank),
+      rankPosition: Number(row.rank),
       id: row.id,
       steamId: row.steam_id,
       steamId64: row.steam_id,
       nickname: row.persona_name,
       avatarUrl: row.avatar_full_url || null,
-      elo2v2: Number(row.elo_2v2 || 100)
+      elo2v2: Number(row.elo_2v2 || 100),
+      rank: getRankForElo(Number(row.elo_2v2 || 100))
     }))
   });
 });
