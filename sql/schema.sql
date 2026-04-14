@@ -210,3 +210,41 @@ CREATE TABLE IF NOT EXISTS player_restrictions (
 
 CREATE INDEX IF NOT EXISTS idx_player_restrictions_active ON player_restrictions(user_id, locked_until DESC);
 CREATE INDEX IF NOT EXISTS idx_player_restriction_events_user ON player_restriction_events(user_id, created_at DESC);
+
+
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS finish_reason TEXT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS cancel_reason TEXT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS final_message TEXT;
+
+CREATE TABLE IF NOT EXISTS match_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  match_id UUID NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  phase TEXT,
+  actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  actor_steam_id TEXT,
+  title TEXT NOT NULL,
+  description TEXT,
+  metadata JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS match_issue_reports (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  match_id UUID NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  player_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  phase TEXT,
+  reason TEXT NOT NULL,
+  comment TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_match_events_match_created ON match_events(match_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_match_issue_reports_match_created ON match_issue_reports(match_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_match_players_match_connection ON match_players(match_id, connection_state);
+CREATE INDEX IF NOT EXISTS idx_match_players_match_seen ON match_players(match_id, result_seen_at);
+CREATE INDEX IF NOT EXISTS idx_matches_status_connect_deadline ON matches(status, connect_expires_at);
+CREATE INDEX IF NOT EXISTS idx_matches_status_accept_deadline ON matches(status, accept_expires_at);
+CREATE INDEX IF NOT EXISTS idx_matches_server_status_created ON matches(server_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_match_issue_reports_player_created ON match_issue_reports(player_id, created_at DESC);

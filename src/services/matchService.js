@@ -2,8 +2,17 @@ const config = require('../config');
 const { query, withTransaction } = require('../db');
 const { applySimpleMatchElo } = require('./eloService');
 const { setPresence } = require('./accountService');
+const { logMatchEvent, normalizeFinishReason, finishReasonLabel, FINISH_REASONS } = require('./matchRoomService');
 
 const MAP_POOL = ['shortdust', 'lake', 'overpass', 'vertigo', 'nuke'];
+const ISSUE_REASONS = [
+  'server_not_responding',
+  'cannot_connect',
+  'player_not_connecting',
+  'match_stuck',
+  'result_not_recorded',
+  'other'
+];
 
 function determineSelectedMap(votes) {
   if (!votes.length) return null;
@@ -21,36 +30,38 @@ function determineSelectedMap(votes) {
   return bestMap;
 }
 
-function toIso(value) {
-  return value ? new Date(value).toISOString() : null;
-}
-
+function toIso(value) { return value ? new Date(value).toISOString() : null; }
 function timeRemainingSec(expiresAt) {
   if (!expiresAt) return null;
   return Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 1000));
 }
-
 function inferPhase(status) {
   switch (status) {
     case 'pending_acceptance': return 'accept';
-    case 'map_voting': return 'map_veto';
+    case 'map_voting': return 'map';
     case 'server_assigned': return 'connect';
     case 'live': return 'live';
-    case 'finished': return 'result';
+    case 'finished': return 'finished';
+    case 'cancelled': return 'cancelled';
     default: return 'waiting';
   }
 }
-
-function buildPhaseTimeline(match, room) {
+function getCurrentDeadline(room) {
+  if (room.phase === 'accept') return room.deadlines.acceptRemainingSec;
+  if (room.phase === 'connect') return room.deadlines.connectRemainingSec;
+  if (room.me?.reconnectRemainingSec) return room.me.reconnectRemainingSec;
+  return null;
+}
+function buildPhaseTimeline(match) {
   const current = inferPhase(match.status);
   const steps = [
     { key: 'accept', title: 'Accept', description: 'Все 4 игрока должны принять матч.' },
-    { key: 'map_veto', title: 'Map', description: 'Игроки выбирают карту из пула TRUST.' },
-    { key: 'connect', title: 'Connect', description: 'Переход на назначенный сервер и проверка подключений.' },
-    { key: 'live', title: 'Live', description: 'Матч идёт, reconnect grace и live state активны.' },
-    { key: 'result', title: 'Result', description: 'Матч завершён, счёт и итог уже зафиксированы.' }
+    { key: 'map', title: 'Map', description: 'Игроки выбирают карту из пула TRUST.' },
+    { key: 'connect', title: 'Connect', description: 'Подключение к назначенному серверу.' },
+    { key: 'live', title: 'Live', description: 'Матч идёт, reconnect grace активен.' },
+    { key: 'finished', title: 'Finished', description: 'Результат записан и доступен игрокам.' }
   ];
-  const order = ['accept', 'map_veto', 'connect', 'live', 'result'];
+  const order = ['accept', 'map', 'connect', 'live', 'finished'];
   const currentIndex = order.indexOf(current);
   return steps.map((step, index) => ({
     ...step,
@@ -58,38 +69,88 @@ function buildPhaseTimeline(match, room) {
   }));
 }
 
-function buildRoomSummary(match, players, myUserId) {
+function buildPlayerView(row, myPartyId) {
+  const sameParty = !!row.party_id && !!myPartyId && row.party_id === myPartyId;
+  const connectionState = row.connection_state || 'waiting_connect';
+  let statusLabel = 'Pending';
+  let statusTone = 'idle';
+  if (connectionState === 'connected') { statusLabel = 'Connected'; statusTone = 'ok'; }
+  else if (connectionState === 'disconnected') { statusLabel = 'Offline'; statusTone = 'warn'; }
+  else if (connectionState === 'abandoned') { statusLabel = 'Abandon'; statusTone = 'danger'; }
+  else if (row.accepted_at) { statusLabel = 'Accepted'; statusTone = 'ok'; }
+
+  return {
+    userId: row.user_id,
+    nickname: row.nickname,
+    avatarUrl: row.avatar_url,
+    elo: Number(row.elo_2v2 || 100),
+    elo2v2: Number(row.elo_2v2 || 100),
+    team: row.team,
+    slotIndex: Number(row.slot_index || 0),
+    partyId: row.party_id || null,
+    partyMarker: sameParty ? 'DUO' : null,
+    accepted: !!row.accepted_at,
+    acceptedAt: toIso(row.accepted_at),
+    mapVote: row.map_vote || null,
+    connectedAt: toIso(row.connected_at),
+    joinedServerAt: toIso(row.joined_server_at),
+    connectionState,
+    disconnectedAt: toIso(row.disconnected_at),
+    reconnectExpiresAt: toIso(row.reconnect_expires_at),
+    reconnectRemainingSec: timeRemainingSec(row.reconnect_expires_at),
+    abandonedAt: toIso(row.abandoned_at),
+    statusLabel,
+    statusTone,
+    isOffline: connectionState === 'disconnected',
+    isReconnecting: connectionState === 'disconnected' && !!row.reconnect_expires_at,
+    isAbandoned: connectionState === 'abandoned' || !!row.abandoned_at
+  };
+}
+
+async function getMatchEvents(matchId, limit = 50) {
+  const result = await query(
+    `SELECT me.event_type, me.phase, me.title, me.description, me.created_at,
+            me.actor_user_id, me.actor_steam_id, me.metadata,
+            u.persona_name AS actor_nickname
+     FROM match_events me
+     LEFT JOIN users u ON u.id = me.actor_user_id
+     WHERE me.match_id = $1
+     ORDER BY me.created_at ASC
+     LIMIT $2`,
+    [matchId, limit]
+  );
+  return result.rows.map((row) => ({
+    type: row.event_type,
+    phase: row.phase,
+    title: row.title,
+    description: row.description,
+    createdAt: toIso(row.created_at),
+    actor: row.actor_user_id ? {
+      userId: row.actor_user_id,
+      steamId: row.actor_steam_id,
+      nickname: row.actor_nickname || null
+    } : null,
+    metadata: row.metadata || null
+  }));
+}
+
+function buildRoomSummary(match, players, events, myUserId) {
   const acceptedCount = players.filter((p) => p.accepted).length;
   const connectedCount = players.filter((p) => p.connectionState === 'connected').length;
   const votes = players.map((p) => p.mapVote).filter(Boolean);
   const myPlayer = players.find((p) => p.userId === myUserId) || null;
-  const myTeam = myPlayer?.team || null;
-  const opponents = players.filter((p) => p.team && p.team !== myTeam);
-  const teammates = players.filter((p) => p.team === myTeam);
-  const phase = inferPhase(match.status);
-  const acceptDeadline = match.accept_expires_at || null;
-  const connectDeadline = match.connect_expires_at || null;
-  const ownReconnectDeadline = myPlayer?.reconnectExpiresAt || null;
-
   const room = {
     matchId: match.public_match_id,
     publicMatchId: match.public_match_id,
     mode: match.mode,
     status: match.status,
-    phase,
-    title: `TRUST ${String(match.mode || '2x2').toUpperCase()} Match Room`,
-    subtitle: phase === 'accept'
-      ? 'Матч найден. Все игроки должны принять его вовремя.'
-      : phase === 'map_veto'
-        ? 'Матч готов. Выбирайте карту и готовьтесь к запуску.'
-        : phase === 'connect'
-          ? 'Сервер назначен. Подключайтесь и готовьтесь к старту.'
-          : phase === 'live'
-            ? 'Матч идёт. Следите за live-статусом и reconnect room.'
-            : 'Матч завершён. Результат уже записан в TRUST.',
-    mapName: match.map_name,
-    selectedMap: match.map_name,
-    mapPool: MAP_POOL,
+    phase: inferPhase(match.status),
+    phaseLabel: inferPhase(match.status).toUpperCase(),
+    mapName: match.map_name || null,
+    finishReason: normalizeFinishReason(match.finish_reason || match.result_source, match.status === 'cancelled' ? 'technical_cancel' : 'finished'),
+    finishReasonLabel: finishReasonLabel(match.finish_reason || match.result_source),
+    finalMessage: match.final_message || null,
+    cancelledReason: match.cancel_reason || null,
     server: {
       id: match.server_id || null,
       name: match.server_name || 'EU-1',
@@ -112,112 +173,84 @@ function buildRoomSummary(match, players, myUserId) {
       connected: connectedCount,
       votes: votes.length
     },
-    me: myPlayer ? {
-      userId: myPlayer.userId,
-      team: myPlayer.team,
-      accepted: myPlayer.accepted,
-      mapVote: myPlayer.mapVote,
-      connectionState: myPlayer.connectionState,
-      connectedAt: myPlayer.connectedAt,
-      reconnectExpiresAt: ownReconnectDeadline,
-      reconnectRemainingSec: timeRemainingSec(ownReconnectDeadline)
-    } : null,
+    me: myPlayer,
     teams: {
-      myTeam,
-      teammates,
-      opponents,
-      teamA: players.filter((p) => p.team === 'A'),
-      teamB: players.filter((p) => p.team === 'B')
+      teamA: players.filter((p) => p.team === 'A').sort((a, b) => a.slotIndex - b.slotIndex),
+      teamB: players.filter((p) => p.team === 'B').sort((a, b) => a.slotIndex - b.slotIndex)
     },
     deadlines: {
-      acceptExpiresAt: acceptDeadline,
-      acceptRemainingSec: timeRemainingSec(acceptDeadline),
-      connectExpiresAt: connectDeadline,
-      connectRemainingSec: timeRemainingSec(connectDeadline)
+      acceptExpiresAt: toIso(match.accept_expires_at),
+      acceptRemainingSec: timeRemainingSec(match.accept_expires_at),
+      connectExpiresAt: toIso(match.connect_expires_at),
+      connectRemainingSec: timeRemainingSec(match.connect_expires_at),
+      reconnectExpiresAt: myPlayer?.reconnectExpiresAt || null,
+      reconnectRemainingSec: myPlayer?.reconnectRemainingSec || null
     },
     actions: {
-      canAccept: phase === 'accept' && !!myPlayer && !myPlayer.accepted,
+      canAccept: inferPhase(match.status) === 'accept' && !!myPlayer && !myPlayer.accepted,
       canVoteMap: ['map_voting', 'server_assigned'].includes(match.status) && !!myPlayer && !match.map_name,
-      canCopyConnect: !!match.server_ip && !!match.server_port,
-      canConnect: ['server_assigned', 'live'].includes(match.status) && !!match.server_ip && !!match.server_port
-    }
+      canConnect: ['server_assigned', 'live'].includes(match.status) && !!match.server_ip && !!match.server_port,
+      canCopyIp: !!match.server_ip && !!match.server_port,
+      canCopyCommand: !!match.server_ip && !!match.server_port,
+      canOpenIssueModal: ['connect', 'live', 'finished'].includes(inferPhase(match.status))
+    },
+    progressTimeline: buildPhaseTimeline(match),
+    eventTimeline: events,
+    currentDeadlineSec: null
   };
-
-  room.timeline = buildPhaseTimeline(match, room);
-  room.players = players;
-  room.statusText = phase === 'accept'
+  room.currentDeadlineSec = getCurrentDeadline(room);
+  room.statusText = room.phase === 'accept'
     ? `${acceptedCount}/${players.length} приняли матч`
-    : phase === 'map_veto'
+    : room.phase === 'map'
       ? `${votes.length}/${players.length} голосов по карте`
-      : phase === 'connect'
+      : room.phase === 'connect'
         ? `${connectedCount}/${players.length} подключились к серверу`
-        : phase === 'live'
-          ? `Матч LIVE • ${connectedCount}/${players.length} сейчас на сервере`
-          : room.score.winnerTeam
-            ? `Победила команда ${room.score.winnerTeam}`
-            : 'Ожидание результата';
-
+        : room.phase === 'live'
+          ? 'Матч LIVE'
+          : room.finishReasonLabel;
   return room;
 }
 
 async function getCurrentMatchByUserId(userId) {
   const result = await query(
-  `SELECT m.id, m.public_match_id, m.mode, m.status, m.map_name, m.server_ip, m.server_port, m.server_password,
-          m.team_a_score, m.team_b_score, m.winner_team, m.server_id,
-          si.name AS server_name, si.region AS server_region,
-          m.accepted_at, m.accept_expires_at, m.map_voting_started_at, m.map_voting_finished_at,
-          m.connect_expires_at, m.started_at, m.finished_at,
-          mp.team, mp.accepted_at AS player_accepted_at, mp.map_vote AS player_map_vote,
-          mp.connected_at AS player_connected_at, mp.connection_state AS player_connection_state,
-          mp.reconnect_expires_at AS player_reconnect_expires_at, mp.abandoned_at AS player_abandoned_at,
-          mp.result_seen_at AS player_result_seen_at
-   FROM match_players mp
-   JOIN matches m ON m.id = mp.match_id
-   LEFT JOIN server_instances si ON si.id::text = m.server_id
-   WHERE mp.user_id = $1 AND (
-     m.status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live')
-     OR (m.status = 'finished' AND (m.result_ack_required = TRUE OR mp.result_seen_at IS NULL))
-   )
-   ORDER BY COALESCE(m.finished_at, m.created_at) DESC
-   LIMIT 1`,
-  [userId]
-);
+    `SELECT m.id, m.public_match_id, m.mode, m.status, m.map_name, m.server_ip, m.server_port, m.server_password,
+            m.team_a_score, m.team_b_score, m.winner_team, m.server_id, m.accept_expires_at,
+            m.map_voting_started_at, m.map_voting_finished_at, m.connect_expires_at, m.started_at, m.finished_at,
+            m.result_source, m.finish_reason, m.cancel_reason, m.final_message,
+            si.name AS server_name, si.region AS server_region,
+            mp.team, mp.accepted_at AS player_accepted_at, mp.map_vote AS player_map_vote,
+            mp.connected_at AS player_connected_at, mp.connection_state AS player_connection_state,
+            mp.reconnect_expires_at AS player_reconnect_expires_at, mp.abandoned_at AS player_abandoned_at,
+            mp.result_seen_at AS player_result_seen_at, mp.party_id AS player_party_id
+     FROM match_players mp
+     JOIN matches m ON m.id = mp.match_id
+     LEFT JOIN server_instances si ON si.id::text = m.server_id
+     WHERE mp.user_id = $1 AND (
+       m.status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live', 'cancelled')
+       OR (m.status = 'finished' AND (m.result_ack_required = TRUE OR mp.result_seen_at IS NULL))
+     )
+     ORDER BY COALESCE(m.finished_at, m.created_at) DESC
+     LIMIT 1`,
+    [userId]
+  );
   const match = result.rows[0] || null;
   if (!match) return null;
 
   const playersResult = await query(
-    `SELECT u.persona_name AS nickname, u.avatar_full_url AS avatar_url, p.elo_2v2, mp.team, mp.slot_index,
-            mp.accepted_at, mp.map_vote, mp.user_id, mp.connected_at, mp.connection_state,
-            mp.reconnect_expires_at, mp.abandoned_at
+    `SELECT u.persona_name AS nickname, u.avatar_full_url AS avatar_url, p.elo_2v2,
+            mp.team, mp.slot_index, mp.accepted_at, mp.map_vote, mp.user_id, mp.party_id,
+            mp.connected_at, mp.joined_server_at, mp.connection_state,
+            mp.disconnected_at, mp.reconnect_expires_at, mp.abandoned_at
      FROM match_players mp
      JOIN users u ON u.id = mp.user_id
-     LEFT JOIN player_profiles p ON p.user_id = u.id
+     LEFT JOIN player_profiles p ON p.user_id = mp.user_id
      WHERE mp.match_id = $1
-     ORDER BY mp.team, mp.slot_index`,
+     ORDER BY mp.team ASC, mp.slot_index ASC`,
     [match.id]
   );
-
-  const players = playersResult.rows.map((row) => ({
-    userId: row.user_id,
-    nickname: row.nickname,
-    avatarUrl: row.avatar_url || null,
-    elo: Number(row.elo_2v2 || 100),
-    team: row.team,
-    slotIndex: row.slot_index,
-    accepted: !!row.accepted_at,
-    acceptedAt: toIso(row.accepted_at),
-    mapVote: row.map_vote || null,
-    connectedAt: toIso(row.connected_at),
-    connectionState: row.connection_state || (row.connected_at ? 'connected' : 'waiting_connect'),
-    reconnectExpiresAt: toIso(row.reconnect_expires_at),
-    reconnectRemainingSec: timeRemainingSec(row.reconnect_expires_at),
-    abandonedAt: toIso(row.abandoned_at)
-  }));
-
-  const acceptedCount = players.filter((p) => p.accepted).length;
-  const votes = players.map((p) => p.mapVote).filter(Boolean);
-  const connectedCount = players.filter((p) => p.connectionState === 'connected').length;
-  const room = buildRoomSummary(match, players, userId);
+  const players = playersResult.rows.map((row) => buildPlayerView(row, match.player_party_id));
+  const events = await getMatchEvents(match.id, 64);
+  const room = buildRoomSummary(match, players, events, userId);
 
   return {
     matchId: match.public_match_id,
@@ -237,11 +270,11 @@ async function getCurrentMatchByUserId(userId) {
     winnerTeam: match.winner_team,
     team: match.team,
     accepted: !!match.player_accepted_at,
-    acceptedCount,
-    connectedCount,
+    acceptedCount: room.counts.accepted,
+    connectedCount: room.counts.connected,
     totalPlayers: players.length,
     mapVote: match.player_map_vote || null,
-    mapVotesCount: votes.length,
+    mapVotesCount: room.counts.votes,
     mapPool: MAP_POOL,
     players,
     room,
@@ -251,21 +284,22 @@ async function getCurrentMatchByUserId(userId) {
     connectRemainingSec: timeRemainingSec(match.connect_expires_at),
     startedAt: toIso(match.started_at),
     finishedAt: toIso(match.finished_at),
-    timeline: room.timeline
+    finishReason: room.finishReason,
+    eventTimeline: events,
+    timeline: room.progressTimeline
   };
 }
 
 async function getMatchRoomByPublicId(userId, publicMatchId) {
   const current = await getCurrentMatchByUserId(userId);
-  if (!current) return null;
-  if (current.publicMatchId !== publicMatchId) return null;
+  if (!current || current.publicMatchId !== publicMatchId) return null;
   return current.room;
 }
 
 async function getMatchHistory(userId, limit = 8) {
   const result = await query(
     `SELECT m.public_match_id, m.mode, m.status, m.map_name, m.team_a_score, m.team_b_score, m.winner_team, m.finished_at,
-            mp.team, mp.elo_before, mp.elo_after, mp.elo_delta, mp.result
+            m.finish_reason, mp.team, mp.elo_before, mp.elo_after, mp.elo_delta, mp.result
      FROM match_players mp
      JOIN matches m ON m.id = mp.match_id
      WHERE mp.user_id = $1 AND m.status = 'finished'
@@ -273,7 +307,10 @@ async function getMatchHistory(userId, limit = 8) {
      LIMIT $2`,
     [userId, limit]
   );
-  return result.rows;
+  return result.rows.map((row) => ({
+    ...row,
+    finishReason: normalizeFinishReason(row.finish_reason)
+  }));
 }
 
 async function acceptCurrentMatch(userId, publicMatchId) {
@@ -293,6 +330,14 @@ async function acceptCurrentMatch(userId, publicMatchId) {
 
     if (!row.accepted_at) {
       await client.query(`UPDATE match_players SET accepted_at = NOW() WHERE match_id = $1 AND user_id = $2`, [row.id, userId]);
+      await logMatchEvent(client, {
+        matchId: row.id,
+        eventType: 'player_accepted',
+        phase: 'accept',
+        actorUserId: userId,
+        title: 'Player accepted',
+        description: 'Игрок подтвердил найденный матч.'
+      });
     }
 
     const counts = await client.query(
@@ -313,6 +358,13 @@ async function acceptCurrentMatch(userId, publicMatchId) {
          WHERE id = $1`,
         [row.id, config.connectTimeoutSeconds]
       );
+      await logMatchEvent(client, {
+        matchId: row.id,
+        eventType: 'all_accepted',
+        phase: 'accept',
+        title: 'All accepted',
+        description: 'Все 4 игрока приняли матч.'
+      });
     }
 
     return { accepted, total };
@@ -342,18 +394,19 @@ async function submitMapVote(userId, publicMatchId, mapName) {
        WHERE match_id = $1 AND user_id = $2`,
       [match.id, userId, mapName]
     );
+    await logMatchEvent(client, {
+      matchId: match.id,
+      eventType: 'map_vote',
+      phase: 'map',
+      actorUserId: userId,
+      title: 'Map vote submitted',
+      description: `Игрок проголосовал за ${mapName}.`,
+      metadata: { mapName }
+    });
 
-    const players = await client.query(
-      `SELECT map_vote
-       FROM match_players
-       WHERE match_id = $1`,
-      [match.id]
-    );
-
+    const players = await client.query(`SELECT map_vote FROM match_players WHERE match_id = $1`, [match.id]);
     const votes = players.rows.map((r) => r.map_vote).filter(Boolean);
-    let selectedMap = null;
-    if (votes.length >= 4) selectedMap = determineSelectedMap(votes);
-
+    let selectedMap = votes.length >= 4 ? determineSelectedMap(votes) : null;
     if (!selectedMap) {
       const maybeMajority = determineSelectedMap(votes);
       const count = votes.filter((v) => v === maybeMajority).length;
@@ -371,23 +424,78 @@ async function submitMapVote(userId, publicMatchId, mapName) {
          WHERE id = $1`,
         [match.id, selectedMap, config.connectTimeoutSeconds]
       );
+      await logMatchEvent(client, {
+        matchId: match.id,
+        eventType: 'map_selected',
+        phase: 'map',
+        title: 'Map selected',
+        description: `Карта ${selectedMap} выбрана для матча.`,
+        metadata: { mapName: selectedMap }
+      });
     }
 
     return { selectedMap };
   });
 }
 
+async function submitMatchIssue({ userId, publicMatchId, phase, reason, comment }) {
+  const normalizedReason = String(reason || '').trim();
+  if (!ISSUE_REASONS.includes(normalizedReason)) throw new Error('invalid_issue_reason');
+  const safeComment = String(comment || '').trim().slice(0, 1000) || null;
+  const normalizedPhase = ['accept', 'map', 'connect', 'live', 'finished', 'cancelled'].includes(String(phase || '').trim())
+    ? String(phase || '').trim()
+    : null;
+
+  return withTransaction(async (client) => {
+    const matchRes = await client.query(
+      `SELECT m.id, m.public_match_id, m.status
+       FROM matches m
+       JOIN match_players mp ON mp.match_id = m.id
+       WHERE m.public_match_id = $1 AND mp.user_id = $2
+       LIMIT 1
+       FOR UPDATE`,
+      [publicMatchId, userId]
+    );
+    const match = matchRes.rows[0];
+    if (!match) throw new Error('match_not_found');
+
+    const insertRes = await client.query(
+      `INSERT INTO match_issue_reports (match_id, player_id, phase, reason, comment)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING id, created_at`,
+      [match.id, userId, normalizedPhase || inferPhase(match.status), normalizedReason, safeComment]
+    );
+
+    await logMatchEvent(client, {
+      matchId: match.id,
+      eventType: 'issue_reported',
+      phase: normalizedPhase || inferPhase(match.status),
+      actorUserId: userId,
+      title: 'Problem reported',
+      description: safeComment || normalizedReason,
+      metadata: { reason: normalizedReason }
+    });
+
+    return {
+      reportId: insertRes.rows[0].id,
+      createdAt: toIso(insertRes.rows[0].created_at)
+    };
+  });
+}
+
 async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBScore, mapName, resultSource = 'server_plugin' }) {
-  const matchResult = await query(`SELECT id, status, server_id FROM matches WHERE public_match_id = $1 LIMIT 1`, [publicMatchId]);
+  const matchResult = await query(`SELECT id, status, server_id, result_source FROM matches WHERE public_match_id = $1 LIMIT 1`, [publicMatchId]);
   const match = matchResult.rows[0];
   if (!match) throw new Error('match_not_found');
-  if (match.status === 'finished') return { alreadyFinished: true };
+  if (match.status === 'finished') return { alreadyFinished: true, duplicate: true, resultSource: match.result_source || null };
+  if (!['server_assigned', 'live'].includes(match.status)) throw new Error('match_not_live');
 
   await withTransaction(async (client) => {
     await client.query(
       `UPDATE matches
        SET status = 'finished', winner_team = $2, team_a_score = $3, team_b_score = $4,
-           map_name = COALESCE($5, map_name), result_source = $6, finished_at = NOW(), result_ack_required = TRUE
+           map_name = COALESCE($5, map_name), result_source = $6, finished_at = NOW(), result_ack_required = TRUE,
+           finish_reason = 'finished', final_message = 'Результат записан и доступен в Match Room.'
        WHERE id = $1`,
       [match.id, winnerTeam, teamAScore, teamBScore, mapName || null, resultSource]
     );
@@ -396,6 +504,14 @@ async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBS
     if (match.server_id) {
       await client.query(`UPDATE server_instances SET status = 'idle', last_heartbeat_at = NOW() WHERE id = $1`, [match.server_id]);
     }
+    await logMatchEvent(client, {
+      matchId: match.id,
+      eventType: 'match_finished',
+      phase: 'finished',
+      title: 'Match finished',
+      description: `Итоговый счёт ${teamAScore}:${teamBScore}.`,
+      metadata: { winnerTeam, teamAScore, teamBScore, mapName: mapName || null }
+    });
   });
 
   await applySimpleMatchElo(match.id, winnerTeam);
@@ -418,11 +534,10 @@ async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBS
   return { alreadyFinished: false };
 }
 
-
 async function getPendingPostMatchSummary(userId) {
   const result = await query(
     `SELECT m.id, m.public_match_id, m.mode, m.map_name, m.team_a_score, m.team_b_score, m.winner_team,
-            m.finished_at, mp.team, mp.result, mp.elo_before, mp.elo_after, mp.elo_delta, mp.result_seen_at
+            m.finished_at, m.finish_reason, mp.team, mp.result, mp.elo_before, mp.elo_after, mp.elo_delta, mp.result_seen_at
      FROM match_players mp
      JOIN matches m ON m.id = mp.match_id
      WHERE mp.user_id = $1
@@ -446,12 +561,13 @@ async function getPendingPostMatchSummary(userId) {
     eloBefore: row.elo_before == null ? null : Number(row.elo_before),
     eloAfter: row.elo_after == null ? null : Number(row.elo_after),
     eloDelta: row.elo_delta == null ? null : Number(row.elo_delta),
+    finishReason: normalizeFinishReason(row.finish_reason),
     finishedAt: row.finished_at
   };
 }
 
 async function acknowledgePostMatchSummary(userId, publicMatchId) {
-  const result = await withTransaction(async (client) => {
+  return withTransaction(async (client) => {
     const rowRes = await client.query(
       `SELECT mp.id, m.id AS match_id
        FROM match_players mp
@@ -465,28 +581,27 @@ async function acknowledgePostMatchSummary(userId, publicMatchId) {
     if (!row) throw new Error('match_not_found');
 
     await client.query(`UPDATE match_players SET result_seen_at = NOW() WHERE id = $1`, [row.id]);
-    const pendingRes = await client.query(
-      `SELECT COUNT(*)::int AS pending
-       FROM match_players mp
-       WHERE mp.match_id = $1 AND mp.result_seen_at IS NULL`,
-      [row.match_id]
-    );
+    const pendingRes = await client.query(`SELECT COUNT(*)::int AS pending FROM match_players WHERE match_id = $1 AND result_seen_at IS NULL`, [row.match_id]);
     if (Number(pendingRes.rows[0]?.pending || 0) === 0) {
       await client.query(`UPDATE matches SET result_ack_required = FALSE WHERE id = $1`, [row.match_id]);
     }
     return true;
   });
-  return result;
 }
 
 module.exports = {
   MAP_POOL,
+  ISSUE_REASONS,
+  FINISH_REASONS,
   getCurrentMatchByUserId,
   getMatchRoomByPublicId,
   getMatchHistory,
   acceptCurrentMatch,
   submitMapVote,
+  submitMatchIssue,
   submitMatchResult,
   getPendingPostMatchSummary,
-  acknowledgePostMatchSummary
+  acknowledgePostMatchSummary,
+  normalizeFinishReason,
+  finishReasonLabel
 };
