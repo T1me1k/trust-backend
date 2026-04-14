@@ -17,6 +17,7 @@ const queueRoutes = require('../src/routes/queue.routes');
 const matchesRoutes = require('../src/routes/matches.routes');
 const launcherRoutes = require('../src/routes/launcher.routes');
 const leaderboardRoutes = require('../src/routes/leaderboard.routes');
+const profileRoutes = require('../src/routes/profile.routes');
 const internalRoutes = require('./routes/internal.routes');
 
 const PORT = Number(process.env.PORT || config.port || 3000);
@@ -75,6 +76,7 @@ function setupRoutes() {
   app.use('/matches', matchesRoutes); app.use('/api/matches', matchesRoutes);
   app.use('/launcher', launcherRoutes); app.use('/api/launcher', launcherRoutes);
   app.use('/leaderboard', leaderboardRoutes); app.use('/api/leaderboard', leaderboardRoutes);
+  app.use('/profile', profileRoutes); app.use('/api/profile', profileRoutes);
   app.use('/internal', internalRoutes);
 
   app.use((req, res) => res.status(404).json({ ok: false, error: 'not_found', path: req.originalUrl }));

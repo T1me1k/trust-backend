@@ -3,12 +3,12 @@ const { requireAuth } = require('../middleware/auth');
 const { ok, fail } = require('../utils/http');
 const {
   getCurrentMatchByUserId,
-  getMatchRoomByPublicId,
   getMatchHistory,
   acceptCurrentMatch,
   submitMapVote,
   MAP_POOL
 } = require('../services/matchService');
+const { getMatchDetailsForUser } = require('../services/profileService');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -24,9 +24,13 @@ router.get('/me/history', async (req, res) => {
 });
 
 
-router.get('/:publicMatchId/room', async (req, res) => {
-  const room = await getMatchRoomByPublicId(req.session.userId, req.params.publicMatchId);
-  return ok(res, { room, mapPool: MAP_POOL });
+router.get('/:publicMatchId/details', async (req, res) => {
+  const match = await getMatchDetailsForUser({
+    publicMatchId: req.params.publicMatchId,
+    viewerUserId: req.session.userId
+  });
+  if (!match) return fail(res, 404, 'match_not_found');
+  return ok(res, { match });
 });
 
 router.post('/:publicMatchId/accept', async (req, res) => {
