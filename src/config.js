@@ -46,5 +46,12 @@ module.exports = {
   defaultServerPort: Number(process.env.DEFAULT_SERVER_PORT || 27015),
   defaultServerPassword: process.env.DEFAULT_SERVER_PASSWORD || 'trust',
   matchmakingIntervalMs: Number(process.env.MATCHMAKING_INTERVAL_MS || 3000),
+  acceptTimeoutSeconds: Number(process.env.ACCEPT_TIMEOUT_SECONDS || 20),
+  mapVoteTimeoutSeconds: Number(process.env.MAP_VOTE_TIMEOUT_SECONDS || 35),
+  connectTimeoutSeconds: Number(process.env.CONNECT_TIMEOUT_SECONDS || 75),
+  reconnectGraceSeconds: Number(process.env.RECONNECT_GRACE_SECONDS || 90),
+  acceptTimeoutPenaltySeconds: Number(process.env.ACCEPT_TIMEOUT_PENALTY_SECONDS || 300),
+  noConnectPenaltySeconds: Number(process.env.NO_CONNECT_PENALTY_SECONDS || 600),
+  abandonPenaltySeconds: Number(process.env.ABANDON_PENALTY_SECONDS || 1800),
   allowedOrigins
 };

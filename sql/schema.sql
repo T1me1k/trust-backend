@@ -168,3 +168,45 @@ CREATE INDEX IF NOT EXISTS idx_match_players_user ON match_players(user_id);
 
 ALTER TABLE presence DROP CONSTRAINT IF EXISTS presence_current_match_fkey;
 ALTER TABLE presence ADD CONSTRAINT presence_current_match_fkey FOREIGN KEY (current_match_id) REFERENCES matches(id) ON DELETE SET NULL;
+
+
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS result_ack_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS result_seen_at TIMESTAMPTZ;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS joined_server_at TIMESTAMPTZ;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS disconnected_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS player_restriction_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  penalty_type TEXT NOT NULL,
+  lock_category TEXT NOT NULL,
+  reason_key TEXT NOT NULL,
+  reason_title TEXT NOT NULL,
+  reason_message TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'system',
+  duration_seconds INTEGER NOT NULL,
+  locked_until TIMESTAMPTZ NOT NULL,
+  match_id UUID REFERENCES matches(id) ON DELETE SET NULL,
+  match_player_id UUID REFERENCES match_players(id) ON DELETE SET NULL,
+  metadata JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS player_restrictions (
+  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  penalty_type TEXT NOT NULL,
+  lock_category TEXT NOT NULL,
+  reason_key TEXT NOT NULL,
+  reason_title TEXT NOT NULL,
+  reason_message TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'system',
+  locked_until TIMESTAMPTZ NOT NULL,
+  active_match_id UUID REFERENCES matches(id) ON DELETE SET NULL,
+  active_match_player_id UUID REFERENCES match_players(id) ON DELETE SET NULL,
+  metadata JSONB,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_player_restrictions_active ON player_restrictions(user_id, locked_until DESC);
+CREATE INDEX IF NOT EXISTS idx_player_restriction_events_user ON player_restriction_events(user_id, created_at DESC);

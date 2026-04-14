@@ -1,3 +1,4 @@
+const config = require('../config');
 const { query, withTransaction } = require('../db');
 const { applySimpleMatchElo } = require('./eloService');
 const { setPresence } = require('./accountService');
@@ -168,11 +169,15 @@ async function getCurrentMatchByUserId(userId) {
           m.connect_expires_at, m.started_at, m.finished_at,
           mp.team, mp.accepted_at AS player_accepted_at, mp.map_vote AS player_map_vote,
           mp.connected_at AS player_connected_at, mp.connection_state AS player_connection_state,
-          mp.reconnect_expires_at AS player_reconnect_expires_at, mp.abandoned_at AS player_abandoned_at
+          mp.reconnect_expires_at AS player_reconnect_expires_at, mp.abandoned_at AS player_abandoned_at,
+          mp.result_seen_at AS player_result_seen_at
    FROM match_players mp
    JOIN matches m ON m.id = mp.match_id
    LEFT JOIN server_instances si ON si.id::text = m.server_id
-   WHERE mp.user_id = $1 AND m.status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live', 'finished')
+   WHERE mp.user_id = $1 AND (
+     m.status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live')
+     OR (m.status = 'finished' AND (m.result_ack_required = TRUE OR mp.result_seen_at IS NULL))
+   )
    ORDER BY COALESCE(m.finished_at, m.created_at) DESC
    LIMIT 1`,
   [userId]
@@ -303,9 +308,10 @@ async function acceptCurrentMatch(userId, publicMatchId) {
         `UPDATE matches
          SET status = CASE WHEN map_name IS NULL THEN 'map_voting' ELSE 'server_assigned' END,
              accepted_at = COALESCE(accepted_at, NOW()),
-             map_voting_started_at = CASE WHEN map_name IS NULL THEN COALESCE(map_voting_started_at, NOW()) ELSE map_voting_started_at END
+             map_voting_started_at = CASE WHEN map_name IS NULL THEN COALESCE(map_voting_started_at, NOW()) ELSE map_voting_started_at END,
+             connect_expires_at = CASE WHEN map_name IS NULL THEN connect_expires_at ELSE COALESCE(connect_expires_at, NOW() + make_interval(secs => $2::int)) END
          WHERE id = $1`,
-        [row.id]
+        [row.id, config.connectTimeoutSeconds]
       );
     }
 
@@ -360,9 +366,10 @@ async function submitMapVote(userId, publicMatchId, mapName) {
          SET map_name = $2,
              map_voting_finished_at = NOW(),
              selected_map_by = 'player_votes',
-             status = 'server_assigned'
+             status = 'server_assigned',
+             connect_expires_at = COALESCE(connect_expires_at, NOW() + make_interval(secs => $3::int))
          WHERE id = $1`,
-        [match.id, selectedMap]
+        [match.id, selectedMap, config.connectTimeoutSeconds]
       );
     }
 
@@ -380,11 +387,12 @@ async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBS
     await client.query(
       `UPDATE matches
        SET status = 'finished', winner_team = $2, team_a_score = $3, team_b_score = $4,
-           map_name = COALESCE($5, map_name), result_source = $6, finished_at = NOW()
+           map_name = COALESCE($5, map_name), result_source = $6, finished_at = NOW(), result_ack_required = TRUE
        WHERE id = $1`,
       [match.id, winnerTeam, teamAScore, teamBScore, mapName || null, resultSource]
     );
 
+    await client.query(`UPDATE match_players SET result_seen_at = NULL WHERE match_id = $1`, [match.id]);
     if (match.server_id) {
       await client.query(`UPDATE server_instances SET status = 'idle', last_heartbeat_at = NOW() WHERE id = $1`, [match.server_id]);
     }
@@ -410,6 +418,67 @@ async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBS
   return { alreadyFinished: false };
 }
 
+
+async function getPendingPostMatchSummary(userId) {
+  const result = await query(
+    `SELECT m.id, m.public_match_id, m.mode, m.map_name, m.team_a_score, m.team_b_score, m.winner_team,
+            m.finished_at, mp.team, mp.result, mp.elo_before, mp.elo_after, mp.elo_delta, mp.result_seen_at
+     FROM match_players mp
+     JOIN matches m ON m.id = mp.match_id
+     WHERE mp.user_id = $1
+       AND m.status = 'finished'
+       AND (m.result_ack_required = TRUE OR mp.result_seen_at IS NULL)
+     ORDER BY m.finished_at DESC NULLS LAST, m.created_at DESC
+     LIMIT 1`,
+    [userId]
+  );
+  const row = result.rows[0] || null;
+  if (!row) return null;
+  return {
+    publicMatchId: row.public_match_id,
+    mode: row.mode,
+    mapName: row.map_name,
+    team: row.team,
+    result: row.result,
+    winnerTeam: row.winner_team,
+    teamAScore: Number(row.team_a_score || 0),
+    teamBScore: Number(row.team_b_score || 0),
+    eloBefore: row.elo_before == null ? null : Number(row.elo_before),
+    eloAfter: row.elo_after == null ? null : Number(row.elo_after),
+    eloDelta: row.elo_delta == null ? null : Number(row.elo_delta),
+    finishedAt: row.finished_at
+  };
+}
+
+async function acknowledgePostMatchSummary(userId, publicMatchId) {
+  const result = await withTransaction(async (client) => {
+    const rowRes = await client.query(
+      `SELECT mp.id, m.id AS match_id
+       FROM match_players mp
+       JOIN matches m ON m.id = mp.match_id
+       WHERE mp.user_id = $1 AND m.public_match_id = $2 AND m.status = 'finished'
+       LIMIT 1
+       FOR UPDATE`,
+      [userId, publicMatchId]
+    );
+    const row = rowRes.rows[0];
+    if (!row) throw new Error('match_not_found');
+
+    await client.query(`UPDATE match_players SET result_seen_at = NOW() WHERE id = $1`, [row.id]);
+    const pendingRes = await client.query(
+      `SELECT COUNT(*)::int AS pending
+       FROM match_players mp
+       WHERE mp.match_id = $1 AND mp.result_seen_at IS NULL`,
+      [row.match_id]
+    );
+    if (Number(pendingRes.rows[0]?.pending || 0) === 0) {
+      await client.query(`UPDATE matches SET result_ack_required = FALSE WHERE id = $1`, [row.match_id]);
+    }
+    return true;
+  });
+  return result;
+}
+
 module.exports = {
   MAP_POOL,
   getCurrentMatchByUserId,
@@ -417,5 +486,7 @@ module.exports = {
   getMatchHistory,
   acceptCurrentMatch,
   submitMapVote,
-  submitMatchResult
+  submitMatchResult,
+  getPendingPostMatchSummary,
+  acknowledgePostMatchSummary
 };

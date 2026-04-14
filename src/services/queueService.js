@@ -3,6 +3,7 @@ const config = require('../config');
 const { query, withTransaction } = require('../db');
 const { createParty, getCurrentPartyByUserId } = require('./partyService');
 const { setPresence } = require('./accountService');
+const { assertCanQueue, getRestrictionState } = require('./restrictionsService');
 
 function newPublicMatchId() {
   return 'match_' + crypto.randomBytes(8).toString('hex');
@@ -40,6 +41,7 @@ async function getPartyForQueue(userId) {
 }
 
 async function joinQueue(userId) {
+  await assertCanQueue(userId);
   const party = await getPartyForQueue(userId);
   if (!party?.id) throw new Error('party_not_found');
   if (party.leader_user_id !== userId) throw new Error('not_party_leader');
@@ -211,10 +213,16 @@ async function createMatchFromSelection(selectedEntries) {
   const match = await withTransaction(async (client) => {
     await client.query(`UPDATE server_instances SET status = 'reserved', last_heartbeat_at = NOW() WHERE id = $1`, [server.id]);
     const matchResult = await client.query(
-      `INSERT INTO matches (public_match_id, mode, status, server_id, server_ip, server_port, server_password, map_name, created_at)
-       VALUES ($1, '2x2', 'pending_acceptance', $2, $3, $4, $5, NULL, NOW())
+      `INSERT INTO matches (
+         public_match_id, mode, status, server_id, server_ip, server_port, server_password,
+         map_name, accept_expires_at, created_at
+       )
+       VALUES (
+         $1, '2x2', 'pending_acceptance', $2, $3, $4, $5,
+         NULL, NOW() + make_interval(secs => $6::int), NOW()
+       )
        RETURNING *`,
-      [publicMatchId, server.id, server.host, server.port, server.server_password]
+      [publicMatchId, server.id, server.host, server.port, server.server_password, config.acceptTimeoutSeconds]
     );
     const row = matchResult.rows[0];
 
@@ -256,4 +264,12 @@ async function runMatchmakingCycle() {
   return createMatchFromSelection(selectedEntries);
 }
 
-module.exports = { getQueueState, joinQueue, cancelQueue, runMatchmakingCycle };
+async function getQueueOverview(userId) {
+  const [queue, restrictions] = await Promise.all([
+    getQueueState(userId),
+    getRestrictionState(userId)
+  ]);
+  return { queue, restrictions };
+}
+
+module.exports = { getQueueState, getQueueOverview, joinQueue, cancelQueue, runMatchmakingCycle };

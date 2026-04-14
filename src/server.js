@@ -9,6 +9,7 @@ const config = require('../src/config');
 const { pool } = require('../src/db');
 const { initSchema } = require('../src/db/initSchema');
 const { runMatchmakingCycle } = require('../src/services/queueService');
+const { runLifecycleTick } = require('../src/services/lifecycleService');
 
 const authRoutes = require('../src/routes/auth.routes');
 const accountRoutes = require('../src/routes/account.routes');
@@ -27,7 +28,9 @@ const MATCHMAKING_INTERVAL_MS = Number(process.env.MATCHMAKING_INTERVAL_MS || co
 const app = express();
 const server = http.createServer(app);
 let matchmakingTimer = null;
+let lifecycleTimer = null;
 let matchmakingRunning = false;
+let lifecycleRunning = false;
 let shuttingDown = false;
 
 function getAllowedOrigins() {
@@ -92,10 +95,22 @@ async function runMatchmakingTick() {
   try { await runMatchmakingCycle(); } catch (e) { console.error('matchmaking cycle error:', e); } finally { matchmakingRunning = false; }
 }
 
+async function runLifecycleTickSafe() {
+  if (lifecycleRunning || shuttingDown) return;
+  lifecycleRunning = true;
+  try { await runLifecycleTick(); } catch (e) { console.error('lifecycle tick error:', e); } finally { lifecycleRunning = false; }
+}
+
 function startMatchmakingLoop() {
   if (matchmakingTimer) return;
   matchmakingTimer = setInterval(() => { void runMatchmakingTick(); }, MATCHMAKING_INTERVAL_MS);
   if (typeof matchmakingTimer.unref === 'function') matchmakingTimer.unref();
+}
+
+function startLifecycleLoop() {
+  if (lifecycleTimer) return;
+  lifecycleTimer = setInterval(() => { void runLifecycleTickSafe(); }, Math.max(1000, Math.floor(MATCHMAKING_INTERVAL_MS / 2)));
+  if (typeof lifecycleTimer.unref === 'function') lifecycleTimer.unref();
 }
 
 async function gracefulShutdown(signal) {
@@ -103,6 +118,7 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
   console.log(`[bootstrap] received ${signal}, shutting down...`);
   if (matchmakingTimer) clearInterval(matchmakingTimer);
+  if (lifecycleTimer) clearInterval(lifecycleTimer);
   await new Promise((resolve) => server.close(resolve));
   process.exit(0);
 }
@@ -114,6 +130,7 @@ async function bootstrap() {
     await initSchema();
     server.listen(PORT, HOST, () => console.log(`TRUST backend listening on ${HOST}:${PORT}`));
     startMatchmakingLoop();
+    startLifecycleLoop();
     process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
     process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
   } catch (e) {

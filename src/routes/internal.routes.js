@@ -200,6 +200,7 @@ router.post('/server/player-connected', async (req, res) => {
       const updateRes = await client.query(
         `UPDATE match_players mp
            SET joined_server_at = COALESCE(joined_server_at, NOW()),
+               connected_at = COALESCE(connected_at, NOW()),
                disconnected_at = NULL,
                reconnect_expires_at = NULL,
                abandoned_at = CASE WHEN mp.connection_state = 'abandoned' THEN NULL ELSE mp.abandoned_at END,

@@ -6,6 +6,8 @@ const {
   getMatchHistory,
   acceptCurrentMatch,
   submitMapVote,
+  getPendingPostMatchSummary,
+  acknowledgePostMatchSummary,
   MAP_POOL
 } = require('../services/matchService');
 const { getMatchDetailsForUser } = require('../services/profileService');
@@ -52,3 +54,17 @@ router.post('/:publicMatchId/map-vote', async (req, res) => {
 });
 
 module.exports = router;
+
+router.get('/me/post-match', async (req, res) => {
+  const summary = await getPendingPostMatchSummary(req.session.userId);
+  return ok(res, { summary });
+});
+
+router.post('/:publicMatchId/post-match/ack', async (req, res) => {
+  try {
+    await acknowledgePostMatchSummary(req.session.userId, req.params.publicMatchId);
+    return ok(res, { acknowledged: true });
+  } catch (err) {
+    return fail(res, 400, err.message || 'post_match_ack_failed');
+  }
+});
