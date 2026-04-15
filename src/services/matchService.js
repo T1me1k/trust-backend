@@ -225,10 +225,7 @@ async function getCurrentMatchByUserId(userId) {
      FROM match_players mp
      JOIN matches m ON m.id = mp.match_id
      LEFT JOIN server_instances si ON si.id::text = m.server_id
-     WHERE mp.user_id = $1 AND (
-       m.status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live', 'cancelled')
-       OR (m.status = 'finished' AND (m.result_ack_required = TRUE OR mp.result_seen_at IS NULL))
-     )
+     WHERE mp.user_id = $1 AND m.status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live')
      ORDER BY COALESCE(m.finished_at, m.created_at) DESC
      LIMIT 1`,
     [userId]
