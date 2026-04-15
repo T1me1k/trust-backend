@@ -11,8 +11,6 @@ const {
   validateSteamLoginState
 } = require('../services/steamService');
 const config = require('../config');
-const { createAuthToken } = require('../utils/authToken');
-const { resolveAuthUserId } = require('../middleware/auth');
 
 const router = express.Router();
 const loginExchangeStore = new Map();
@@ -74,10 +72,9 @@ function appendExchangeToReturnUrl(returnTo, exchange) {
 
 router.get('/me', async (req, res) => {
   try {
-    const authUserId = resolveAuthUserId(req);
-    if (!authUserId) return ok(res, { user: null });
+    if (!req.session?.userId) return ok(res, { user: null });
 
-    const account = await getAccountByUserId(authUserId);
+    const account = await getAccountByUserId(req.session.userId);
     if (!account) return ok(res, { user: null });
 
     return ok(res, {
@@ -110,7 +107,6 @@ router.post('/exchange', async (req, res) => {
 
     req.session.userId = item.userId;
     const account = await getAccountByUserId(item.userId);
-    const authToken = createAuthToken(item.userId);
 
     req.session.save((err) => {
       if (err) {
@@ -120,7 +116,6 @@ router.post('/exchange', async (req, res) => {
 
       return ok(res, {
         exchanged: true,
-        token: authToken,
         user: account ? {
           id: account.id,
           steamId: account.steam_id || null,

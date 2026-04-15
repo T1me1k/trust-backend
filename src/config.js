@@ -38,7 +38,6 @@ module.exports = {
   publicSiteUrl: process.env.PUBLIC_SITE_URL || '',
   siteOrigin: process.env.SITE_ORIGIN || process.env.PUBLIC_SITE_URL || '',
   sessionSecret: process.env.SESSION_SECRET || 'change_me',
-  authTokenTtlDays: Number(process.env.AUTH_TOKEN_TTL_DAYS || 30),
   steamApiKey: process.env.STEAM_API_KEY || '',
   cookieSecure: parseBool(process.env.COOKIE_SECURE, true),
   defaultRegion: process.env.DEFAULT_REGION || 'EU',
