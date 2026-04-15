@@ -40,6 +40,7 @@ module.exports = {
   sessionSecret: process.env.SESSION_SECRET || 'change_me',
   steamApiKey: process.env.STEAM_API_KEY || '',
   cookieSecure: parseBool(process.env.COOKIE_SECURE, true),
+  authTokenTtlDays: Number(process.env.AUTH_TOKEN_TTL_DAYS || 30),
   defaultRegion: process.env.DEFAULT_REGION || 'EU',
   defaultMatchMode: process.env.DEFAULT_MATCH_MODE || '2x2',
   defaultServerIp: process.env.DEFAULT_SERVER_IP || '127.0.0.1',

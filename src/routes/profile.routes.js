@@ -10,12 +10,12 @@ const router = express.Router();
 router.use(requireAuth);
 
 router.get('/me', async (req, res) => {
-  const profile = await getProfileSummaryByUserId(req.session.userId);
+  const profile = await getProfileSummaryByUserId(req.authUserId);
   return ok(res, { profile });
 });
 
 router.get('/me/history', async (req, res) => {
-  const items = await getProfileHistoryByUserId(req.session.userId, req.query.limit);
+  const items = await getProfileHistoryByUserId(req.authUserId, req.query.limit);
   return ok(res, { items });
 });
 
