@@ -60,11 +60,11 @@ function setupCoreMiddleware() {
     saveUninitialized: false,
     rolling: true,
     cookie: {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',
-      maxAge: 1000 * 60 * 60 * 24 * 30
-    }
+  httpOnly: true,
+  secure: true,
+  sameSite: 'none',
+  maxAge: 1000 * 60 * 60 * 24 * 30
+}
   }));
 }
 
