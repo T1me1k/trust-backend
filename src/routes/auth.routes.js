@@ -13,6 +13,32 @@ const config = require('../config');
 
 const router = express.Router();
 
+function normalizeBase(value) {
+  return String(value || '').replace(/\/+$/, '');
+}
+
+function getDefaultReturnUrl() {
+  return `${normalizeBase(config.publicSiteUrl)}/app.html`;
+}
+
+function sanitizeReturnTo(rawValue) {
+  const fallback = getDefaultReturnUrl();
+  if (typeof rawValue !== 'string' || !rawValue.trim()) return fallback;
+
+  try {
+    const requested = new URL(rawValue.trim());
+    const publicSiteOrigin = new URL(normalizeBase(config.publicSiteUrl)).origin;
+
+    if (requested.origin !== publicSiteOrigin) {
+      return fallback;
+    }
+
+    return requested.toString();
+  } catch (_) {
+    return fallback;
+  }
+}
+
 router.get('/me', async (req, res) => {
   try {
     if (!req.session?.userId) return ok(res, { user: null });
@@ -43,10 +69,14 @@ router.get('/me', async (req, res) => {
 
 router.get('/steam', (req, res) => {
   if (!config.backendBaseUrl) return fail(res, 500, 'backend_base_url_missing');
+  if (!config.publicSiteUrl) return fail(res, 500, 'public_site_url_missing');
+
+  const requestedReturnTo = sanitizeReturnTo(req.query.returnTo);
+  req.session.postAuthReturnTo = requestedReturnTo;
 
   const state = createSteamLoginState(req);
-  const returnTo = `${config.backendBaseUrl.replace(/\/+$/, '')}/auth/steam/callback?state=${encodeURIComponent(state)}`;
-  const loginUrl = buildSteamLoginUrl(returnTo);
+  const callbackUrl = `${normalizeBase(config.backendBaseUrl)}/auth/steam/callback?state=${encodeURIComponent(state)}`;
+  const loginUrl = buildSteamLoginUrl(callbackUrl);
 
   req.session.save((err) => {
     if (err) {
@@ -61,7 +91,7 @@ router.get('/steam/callback', async (req, res) => {
   try {
     const state = typeof req.query.state === 'string' ? req.query.state : '';
     if (!validateSteamLoginState(req, state)) {
-      return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/?auth_error=invalid_state`);
+      return res.redirect(`${normalizeBase(config.publicSiteUrl)}/?auth_error=invalid_state`);
     }
 
     const steamId = await verifySteamOpenId(req.query);
@@ -71,19 +101,22 @@ router.get('/steam/callback', async (req, res) => {
     req.session.userId = user.id;
     delete req.session.steamLoginState;
 
+    const postAuthReturnTo = sanitizeReturnTo(req.session.postAuthReturnTo);
+    delete req.session.postAuthReturnTo;
+
     await ensurePlayerProfile(user.id);
     await setPresence(user.id, 'online', null, null);
 
     req.session.save((err) => {
       if (err) {
         console.error('session save after steam callback failed:', err);
-        return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/?auth_error=session_save_failed`);
+        return res.redirect(`${normalizeBase(config.publicSiteUrl)}/?auth_error=session_save_failed`);
       }
-      return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/app.html`);
+      return res.redirect(postAuthReturnTo);
     });
   } catch (err) {
     console.error('steam callback error:', err);
-    return res.redirect(`${config.publicSiteUrl.replace(/\/+$/, '')}/?auth_error=1`);
+    return res.redirect(`${normalizeBase(config.publicSiteUrl)}/?auth_error=1`);
   }
 });
 
