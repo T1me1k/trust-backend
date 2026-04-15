@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS match_players (
   accepted_at TIMESTAMPTZ,
   map_vote TEXT,
   map_vote_at TIMESTAMPTZ,
-  connection_state TEXT NOT NULL DEFAULT 'waiting_connect',
+  connection_state TEXT NOT NULL DEFAULT 'pending_connect',
   reconnect_expires_at TIMESTAMPTZ,
   abandoned_at TIMESTAMPTZ,
   elo_before INTEGER,
@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS match_players (
   UNIQUE (match_id, user_id),
   CONSTRAINT match_players_team_check CHECK (team IN ('A','B')),
   CONSTRAINT match_players_result_check CHECK (result IN ('win','loss') OR result IS NULL),
-  CONSTRAINT match_players_connection_state_check CHECK (connection_state IN ('waiting_connect','connected','disconnected','abandoned'))
+  CONSTRAINT match_players_connection_state_check CHECK (connection_state IN ('pending_connect','connected','disconnected','abandoned'))
 );
 
 CREATE TABLE IF NOT EXISTS server_instances (

@@ -71,13 +71,13 @@ function buildPhaseTimeline(match) {
 
 function buildPlayerView(row, myPartyId) {
   const sameParty = !!row.party_id && !!myPartyId && row.party_id === myPartyId;
-  const connectionState = row.connection_state || 'waiting_connect';
+  const connectionState = row.connection_state || 'pending_connect';
   let statusLabel = 'Pending';
   let statusTone = 'idle';
   if (connectionState === 'connected') { statusLabel = 'Connected'; statusTone = 'ok'; }
   else if (connectionState === 'disconnected') { statusLabel = 'Offline'; statusTone = 'warn'; }
   else if (connectionState === 'abandoned') { statusLabel = 'Abandon'; statusTone = 'danger'; }
-  else if (row.accepted_at) { statusLabel = 'Accepted'; statusTone = 'ok'; }
+  else if (connectionState === 'pending_connect' || row.accepted_at) { statusLabel = row.accepted_at ? 'Accepted' : 'Pending'; statusTone = row.accepted_at ? 'ok' : 'idle'; }
 
   return {
     userId: row.user_id,

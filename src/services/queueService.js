@@ -190,9 +190,15 @@ function assignTeams(selectedEntries) {
 }
 
 async function createMatchFromSelection(selectedEntries) {
-  if (!Array.isArray(selectedEntries) || !selectedEntries.length) return null;
   const assignments = assignTeams(selectedEntries);
   if (!assignments) return null;
+
+  const diagnostics = {
+    key: 'matchmaking_diagnostics',
+    selectedPartyIds: selectedEntries.map((entry) => entry.party_id),
+    selectedMemberCounts: selectedEntries.map((entry) => Number(entry.member_count || 0)),
+    assignments
+  };
 
   const grouped = [];
   for (const assignment of assignments) {
@@ -212,6 +218,7 @@ async function createMatchFromSelection(selectedEntries) {
   const partyIds = grouped.map((group) => group.partyId);
 
   const match = await withTransaction(async (client) => {
+    await client.query("SET LOCAL application_name = 'trust_matchmaker'").catch(() => {});
     await client.query(`UPDATE server_instances SET status = 'reserved', last_heartbeat_at = NOW() WHERE id = $1`, [server.id]);
     const matchResult = await client.query(
       `INSERT INTO matches (
@@ -233,8 +240,8 @@ async function createMatchFromSelection(selectedEntries) {
       for (const member of group.members) {
         const slotIndex = group.team === 'A' ? slotA++ : slotB++;
         await client.query(
-          `INSERT INTO match_players (match_id, user_id, party_id, team, slot_index)
-           VALUES ($1, $2, $3, $4, $5)`,
+          `INSERT INTO match_players (match_id, user_id, party_id, team, slot_index, connection_state)
+           VALUES ($1, $2, $3, $4, $5, 'pending_connect')`,
           [row.id, member.user_id, group.partyId, group.team, slotIndex]
         );
       }
@@ -246,6 +253,9 @@ async function createMatchFromSelection(selectedEntries) {
     }
 
     return row;
+  }).catch((err) => {
+    err.message = `${err.message} | ${JSON.stringify(diagnostics)}`;
+    throw err;
   });
 
   for (const group of grouped) {
@@ -265,38 +275,6 @@ async function runMatchmakingCycle() {
   return createMatchFromSelection(selectedEntries);
 }
 
-async function maybeRunMatchmakingFallback() {
-  const entries = await loadQueuedEntries();
-  const searchingPlayers = entries.reduce((sum, entry) => sum + Number(entry.member_count || 0), 0);
-  if (searchingPlayers < 4) {
-    return { searchingPlayers, triggered: false, reason: 'not_enough_players' };
-  }
-
-  const activeMatchesRes = await query(
-    `SELECT COUNT(*)::int AS active_matches
-     FROM matches
-     WHERE status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live')`
-  );
-  const activeMatches = Number(activeMatchesRes.rows[0]?.active_matches || 0);
-  const selectedEntries = pickEntriesFor2x2(entries);
-
-  if (!selectedEntries) {
-    return { searchingPlayers, activeMatches, triggered: false, reason: 'no_valid_combination' };
-  }
-
-  if (activeMatches > 0) {
-    return { searchingPlayers, activeMatches, triggered: false, reason: 'active_match_exists' };
-  }
-
-  const created = await createMatchFromSelection(selectedEntries);
-  return {
-    searchingPlayers,
-    activeMatchesBefore: activeMatches,
-    triggered: !!created,
-    reason: created ? 'created' : 'create_failed',
-    publicMatchId: created?.public_match_id || null
-  };
-}
 
 async function getPublicQueueStats() {
   const [searchingRes, activeMatchesRes] = await Promise.all([
@@ -320,25 +298,6 @@ async function getPublicQueueStats() {
   };
 }
 
-async function getQueueDebugSnapshot() {
-  const entries = await loadQueuedEntries();
-  const selectedEntries = pickEntriesFor2x2(entries) || [];
-  return {
-    queuedEntries: entries.map((entry) => ({
-      partyId: entry.party_id,
-      leaderUserId: entry.leader_user_id,
-      memberCount: Number(entry.member_count || 0),
-      queuedAt: entry.queued_at
-    })),
-    selectedEntries: selectedEntries.map((entry) => ({
-      partyId: entry.party_id,
-      leaderUserId: entry.leader_user_id,
-      memberCount: Number(entry.member_count || 0),
-      queuedAt: entry.queued_at
-    }))
-  };
-}
-
 async function getQueueOverview(userId) {
   const [queue, restrictions] = await Promise.all([
     getQueueState(userId),
@@ -347,4 +306,4 @@ async function getQueueOverview(userId) {
   return { queue, restrictions };
 }
 
-module.exports = { getQueueState, getQueueOverview, getPublicQueueStats, getQueueDebugSnapshot, joinQueue, cancelQueue, runMatchmakingCycle, maybeRunMatchmakingFallback };
+module.exports = { getQueueState, getQueueOverview, getPublicQueueStats, joinQueue, cancelQueue, runMatchmakingCycle };
