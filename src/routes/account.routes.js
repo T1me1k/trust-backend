@@ -6,7 +6,7 @@ const { getAccountByUserId, getHistoryByUserId, searchUsersByNickname } = requir
 const router = express.Router();
 
 router.get('/me', requireAuth, async (req, res) => {
-  const account = await getAccountByUserId(req.session.userId);
+  const account = await getAccountByUserId(req.authUserId);
   return ok(res, {
     user: {
       id: account.id,
@@ -25,12 +25,12 @@ router.get('/me', requireAuth, async (req, res) => {
 });
 
 router.get('/me/history', requireAuth, async (req, res) => {
-  const items = await getHistoryByUserId(req.session.userId, Number(req.query.limit || 8));
+  const items = await getHistoryByUserId(req.authUserId, Number(req.query.limit || 8));
   return ok(res, { items });
 });
 
 router.get('/me/stats', requireAuth, async (req, res) => {
-  const account = await getAccountByUserId(req.session.userId);
+  const account = await getAccountByUserId(req.authUserId);
   return ok(res, {
     stats: {
       elo2v2: Number(account.elo_2v2 || 100),
@@ -44,7 +44,7 @@ router.get('/me/stats', requireAuth, async (req, res) => {
 router.get('/users/search', requireAuth, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return fail(res, 400, 'missing_query');
-  const items = await searchUsersByNickname(q, req.session.userId);
+  const items = await searchUsersByNickname(q, req.authUserId);
   return ok(res, {
     items: items.map((item) => ({
       id: item.id,
