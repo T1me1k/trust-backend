@@ -1,9 +1,15 @@
 const express = require('express');
 const { requireAuth } = require('../middleware/auth');
 const { ok, fail } = require('../utils/http');
-const { getQueueState, getQueueOverview, joinQueue, cancelQueue } = require('../services/queueService');
+const { getQueueState, getQueueOverview, getPublicQueueStats, joinQueue, cancelQueue } = require('../services/queueService');
 
 const router = express.Router();
+
+router.get('/stats', async (_req, res) => {
+  const stats = await getPublicQueueStats();
+  return ok(res, { stats });
+});
+
 router.use(requireAuth);
 
 router.get('/me', async (req, res) => {
@@ -15,6 +21,7 @@ router.get('/restrictions', async (req, res) => {
   const overview = await getQueueOverview(req.session.userId);
   return ok(res, { restrictions: overview.restrictions });
 });
+
 
 router.post('/join', async (req, res) => {
   try {

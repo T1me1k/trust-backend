@@ -264,6 +264,29 @@ async function runMatchmakingCycle() {
   return createMatchFromSelection(selectedEntries);
 }
 
+
+async function getPublicQueueStats() {
+  const [searchingRes, activeMatchesRes] = await Promise.all([
+    query(
+      `SELECT COUNT(pm.user_id)::int AS searching_players
+       FROM queue_entries qe
+       JOIN parties p ON p.id = qe.party_id
+       JOIN party_members pm ON pm.party_id = qe.party_id
+       WHERE qe.status = 'queued' AND qe.mode = '2x2' AND p.status = 'searching'`
+    ),
+    query(
+      `SELECT COUNT(*)::int AS active_matches
+       FROM matches
+       WHERE status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live')`
+    )
+  ]);
+
+  return {
+    searchingPlayers: Number(searchingRes.rows[0]?.searching_players || 0),
+    activeMatches: Number(activeMatchesRes.rows[0]?.active_matches || 0)
+  };
+}
+
 async function getQueueOverview(userId) {
   const [queue, restrictions] = await Promise.all([
     getQueueState(userId),
@@ -272,4 +295,4 @@ async function getQueueOverview(userId) {
   return { queue, restrictions };
 }
 
-module.exports = { getQueueState, getQueueOverview, joinQueue, cancelQueue, runMatchmakingCycle };
+module.exports = { getQueueState, getQueueOverview, getPublicQueueStats, joinQueue, cancelQueue, runMatchmakingCycle };
