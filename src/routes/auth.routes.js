@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const { ok, fail } = require('../utils/http');
 const { ensurePlayerProfile, setPresence, getAccountByUserId } = require('../services/accountService');
@@ -9,11 +10,11 @@ const {
   createSteamLoginState,
   validateSteamLoginState
 } = require('../services/steamService');
-const { createAuthToken } = require('../utils/authToken');
-const { resolveAuthUserId } = require('../middleware/auth');
 const config = require('../config');
 
 const router = express.Router();
+const loginExchangeStore = new Map();
+const LOGIN_EXCHANGE_TTL_MS = 1000 * 60 * 5;
 
 function normalizeBase(value) {
   return String(value || '').replace(/\/+$/, '');
@@ -37,21 +38,43 @@ function sanitizeReturnTo(rawValue) {
   }
 }
 
-function appendAuthHash(returnTo, token) {
+function createLoginExchange(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  loginExchangeStore.set(token, {
+    userId: Number(userId),
+    expiresAt: Date.now() + LOGIN_EXCHANGE_TTL_MS
+  });
+  return token;
+}
+
+function consumeLoginExchange(token) {
+  if (!token || typeof token !== 'string') return null;
+  const item = loginExchangeStore.get(token);
+  if (!item) return null;
+  loginExchangeStore.delete(token);
+  if (!item.userId || item.expiresAt < Date.now()) return null;
+  return item;
+}
+
+function cleanupLoginExchanges() {
+  const now = Date.now();
+  for (const [token, item] of loginExchangeStore.entries()) {
+    if (!item || item.expiresAt < now) loginExchangeStore.delete(token);
+  }
+}
+
+function appendExchangeToReturnUrl(returnTo, exchange) {
   const url = new URL(returnTo);
-  const hashParams = new URLSearchParams(url.hash.startsWith('#') ? url.hash.slice(1) : url.hash);
-  hashParams.set('steam_login', '1');
-  hashParams.set('auth_token', token);
-  url.hash = hashParams.toString();
+  url.searchParams.set('steam_login', '1');
+  url.searchParams.set('auth_exchange', exchange);
   return url.toString();
 }
 
 router.get('/me', async (req, res) => {
   try {
-    const userId = resolveAuthUserId(req);
-    if (!userId) return ok(res, { user: null });
+    if (!req.session?.userId) return ok(res, { user: null });
 
-    const account = await getAccountByUserId(userId);
+    const account = await getAccountByUserId(req.session.userId);
     if (!account) return ok(res, { user: null });
 
     return ok(res, {
@@ -75,6 +98,45 @@ router.get('/me', async (req, res) => {
   }
 });
 
+router.post('/exchange', async (req, res) => {
+  try {
+    cleanupLoginExchanges();
+    const exchange = String(req.body?.exchange || '').trim();
+    const item = consumeLoginExchange(exchange);
+    if (!item?.userId) return fail(res, 401, 'invalid_exchange');
+
+    req.session.userId = item.userId;
+    const account = await getAccountByUserId(item.userId);
+
+    req.session.save((err) => {
+      if (err) {
+        console.error('session save after exchange failed:', err);
+        return fail(res, 500, 'session_save_failed');
+      }
+
+      return ok(res, {
+        exchanged: true,
+        user: account ? {
+          id: account.id,
+          steamId: account.steam_id || null,
+          steamId64: account.steam_id || null,
+          nickname: account.persona_name || null,
+          avatarUrl: account.avatar_full_url || account.avatar_medium_url || account.avatar_url || null,
+          profileUrl: account.profile_url || null,
+          elo2v2: Number(account.elo_2v2 || 100),
+          wins2v2: Number(account.wins_2v2 || 0),
+          losses2v2: Number(account.losses_2v2 || 0),
+          matchesPlayed2v2: Number(account.matches_played_2v2 || 0),
+          presence: account.presence || 'online'
+        } : null
+      });
+    });
+  } catch (err) {
+    console.error('auth /exchange error:', err);
+    return fail(res, 500, 'auth_exchange_failed');
+  }
+});
+
 router.get('/steam', (req, res) => {
   if (!config.backendBaseUrl) return fail(res, 500, 'backend_base_url_missing');
   if (!config.publicSiteUrl) return fail(res, 500, 'public_site_url_missing');
@@ -82,8 +144,8 @@ router.get('/steam', (req, res) => {
   req.session.postAuthReturnTo = sanitizeReturnTo(req.query.returnTo);
 
   const state = createSteamLoginState(req);
-  const callbackUrl = `${normalizeBase(config.backendBaseUrl)}/auth/steam/callback?state=${encodeURIComponent(state)}`;
-  const loginUrl = buildSteamLoginUrl(callbackUrl);
+  const returnTo = `${normalizeBase(config.backendBaseUrl)}/auth/steam/callback?state=${encodeURIComponent(state)}`;
+  const loginUrl = buildSteamLoginUrl(returnTo);
 
   req.session.save((err) => {
     if (err) {
@@ -96,6 +158,8 @@ router.get('/steam', (req, res) => {
 
 router.get('/steam/callback', async (req, res) => {
   try {
+    cleanupLoginExchanges();
+
     const state = typeof req.query.state === 'string' ? req.query.state : '';
     if (!validateSteamLoginState(req, state)) {
       return res.redirect(`${normalizeBase(config.publicSiteUrl)}/?auth_error=invalid_state`);
@@ -111,15 +175,15 @@ router.get('/steam/callback', async (req, res) => {
     await ensurePlayerProfile(user.id);
     await setPresence(user.id, 'online', null, null);
 
-    const token = createAuthToken(user.id);
     const postAuthReturnTo = sanitizeReturnTo(req.session.postAuthReturnTo);
     delete req.session.postAuthReturnTo;
+    const exchange = createLoginExchange(user.id);
 
     req.session.save((err) => {
       if (err) {
         console.error('session save after steam callback failed:', err);
       }
-      return res.redirect(appendAuthHash(postAuthReturnTo, token));
+      return res.redirect(appendExchangeToReturnUrl(postAuthReturnTo, exchange));
     });
   } catch (err) {
     console.error('steam callback error:', err);
