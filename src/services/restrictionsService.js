@@ -83,7 +83,12 @@ async function getRestrictionState(userId) {
        FROM match_players mp
        JOIN matches m ON m.id = mp.match_id
        WHERE mp.user_id = $1
-         AND m.status IN ('pending_acceptance', 'map_voting', 'server_assigned', 'live')
+         AND (
+           m.status = 'map_voting'
+           OR m.status = 'live'
+           OR (m.status = 'pending_acceptance' AND (m.accept_expires_at IS NULL OR m.accept_expires_at > NOW()))
+           OR (m.status = 'server_assigned' AND (m.connect_expires_at IS NULL OR m.connect_expires_at > NOW()))
+         )
        ORDER BY m.created_at DESC
        LIMIT 1`,
       [userId]
