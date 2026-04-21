@@ -54,14 +54,21 @@ function getCurrentDeadline(room) {
 }
 function buildPhaseTimeline(match) {
   const current = inferPhase(match.status);
+  const isCancelled = current === 'cancelled';
   const steps = [
     { key: 'accept', title: 'Accept', description: 'Все 4 игрока должны принять матч.' },
     { key: 'map', title: 'Map', description: 'Игроки выбирают карту из пула TRUST.' },
     { key: 'connect', title: 'Connect', description: 'Подключение к назначенному серверу.' },
     { key: 'live', title: 'Live', description: 'Матч идёт, reconnect grace активен.' },
-    { key: 'finished', title: 'Finished', description: 'Результат записан и доступен игрокам.' }
+    {
+      key: isCancelled ? 'cancelled' : 'finished',
+      title: isCancelled ? 'Cancelled' : 'Finished',
+      description: isCancelled
+        ? (finishReasonLabel(match.finish_reason || match.result_source) || 'Матч отменён.')
+        : 'Результат записан и доступен игрокам.'
+    }
   ];
-  const order = ['accept', 'map', 'connect', 'live', 'finished'];
+  const order = ['accept', 'map', 'connect', 'live', isCancelled ? 'cancelled' : 'finished'];
   const currentIndex = order.indexOf(current);
   return steps.map((step, index) => ({
     ...step,
@@ -231,6 +238,7 @@ async function getCurrentMatchByUserId(userId) {
          OR m.status = 'live'
          OR (m.status = 'pending_acceptance' AND (m.accept_expires_at IS NULL OR m.accept_expires_at > NOW()))
          OR (m.status = 'server_assigned' AND (m.connect_expires_at IS NULL OR m.connect_expires_at > NOW()))
+         OR (m.status = 'cancelled' AND (m.finished_at IS NULL OR m.finished_at >= NOW() - INTERVAL '2 hours'))
        )
      ORDER BY COALESCE(m.finished_at, m.created_at) DESC
      LIMIT 1`,
