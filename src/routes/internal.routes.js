@@ -3,13 +3,17 @@ const { query, withTransaction } = require('../db');
 const { ok, fail } = require('../utils/http');
 const { submitMatchResult } = require('../services/matchService');
 const { logMatchEvent } = require('../services/matchRoomService');
+const config = require('../config');
 
 const router = express.Router();
 const RECONNECT_GRACE_SECONDS = Number(process.env.RECONNECT_GRACE_SECONDS || 90);
 
 async function getServerByToken(token) {
-  if (!token) return null;
-  const result = await query(`SELECT * FROM server_instances WHERE server_token = $1 LIMIT 1`, [token]);
+  const normalizedToken = String(token || '').trim();
+  if (!normalizedToken) return null;
+  if (config.trustProductionMode && ['change_me', 'local-dev-token', 'trust', ''].includes(normalizedToken)) return null;
+  if (config.trustProductionMode && normalizedToken.length < 32) return null;
+  const result = await query(`SELECT * FROM server_instances WHERE server_token = $1 LIMIT 1`, [normalizedToken]);
   return result.rows[0] || null;
 }
 async function getActiveMatchForServer(serverId) {
@@ -48,7 +52,10 @@ function buildConfigText(match, players) {
   lines.push(`status=${match.status}`);
   lines.push('team_a_name=Team A');
   lines.push('team_b_name=Team B');
-  for (const player of players) lines.push(`player=${player.steam_id}|${player.persona_name}|${player.team}`);
+  for (const player of players) {
+    const safeName = String(player.persona_name || 'Player').replace(/[|\r\n]/g, ' ').slice(0, 64);
+    lines.push(`player=${player.steam_id}|${safeName}|${player.team}`);
+  }
   return `${lines.join('\n')}\n`;
 }
 async function refreshReconnectTimeoutState(serverId) {
@@ -226,7 +233,8 @@ router.get('/server/result-config-text', async (req, res) => {
   try {
     const match = await getActiveMatchForServer(req.trustServer.id);
     if (!match) return res.type('text/plain').send('active=0\n');
-    return res.type('text/plain').send(`active=1\nmatch_id=${match.public_match_id}\nmap=${mapLabelToServerMap(match.map_name)}\n`);
+    const players = await getMatchPlayers(match.id);
+    return res.type('text/plain').send(buildConfigText(match, players));
   } catch (err) { return fail(res, 400, err.message || 'result_config_failed'); }
 });
 
@@ -234,7 +242,12 @@ router.post('/server/result', async (req, res) => {
   try {
     const { matchId, winnerTeam, teamAScore, teamBScore, map } = req.body || {};
     if (!matchId || !winnerTeam) return fail(res, 400, 'missing_fields');
-    const result = await submitMatchResult({ publicMatchId: String(matchId), winnerTeam: String(winnerTeam), teamAScore: Number(teamAScore || 0), teamBScore: Number(teamBScore || 0), mapName: String(map || ''), resultSource: 'server_plugin' });
+    const normalizedWinnerTeam = String(winnerTeam).trim().toUpperCase();
+    if (!['A', 'B'].includes(normalizedWinnerTeam)) return fail(res, 400, 'invalid_winner_team');
+    const safeTeamAScore = Number(teamAScore);
+    const safeTeamBScore = Number(teamBScore);
+    if (!Number.isFinite(safeTeamAScore) || !Number.isFinite(safeTeamBScore) || safeTeamAScore < 0 || safeTeamBScore < 0) return fail(res, 400, 'invalid_score');
+    const result = await submitMatchResult({ publicMatchId: String(matchId), winnerTeam: normalizedWinnerTeam, teamAScore: Math.floor(safeTeamAScore), teamBScore: Math.floor(safeTeamBScore), mapName: String(map || ''), resultSource: 'server_plugin' });
     return ok(res, result);
   } catch (err) { return fail(res, 400, err.message || 'result_submit_failed'); }
 });

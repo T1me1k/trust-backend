@@ -495,6 +495,12 @@ async function submitMatchIssue({ userId, publicMatchId, phase, reason, comment 
 }
 
 async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBScore, mapName, resultSource = 'server_plugin' }) {
+  const normalizedWinnerTeam = String(winnerTeam || '').trim().toUpperCase();
+  const safeTeamAScore = Number(teamAScore);
+  const safeTeamBScore = Number(teamBScore);
+  if (!['A', 'B'].includes(normalizedWinnerTeam)) throw new Error('invalid_winner_team');
+  if (!Number.isFinite(safeTeamAScore) || !Number.isFinite(safeTeamBScore) || safeTeamAScore < 0 || safeTeamBScore < 0) throw new Error('invalid_score');
+
   const matchResult = await query(`SELECT id, status, server_id, result_source FROM matches WHERE public_match_id = $1 LIMIT 1`, [publicMatchId]);
   const match = matchResult.rows[0];
   if (!match) throw new Error('match_not_found');
@@ -508,7 +514,7 @@ async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBS
            map_name = COALESCE($5, map_name), result_source = $6, finished_at = NOW(), result_ack_required = TRUE,
            finish_reason = 'finished', final_message = 'Результат записан и доступен в Match Room.'
        WHERE id = $1`,
-      [match.id, winnerTeam, teamAScore, teamBScore, mapName || null, resultSource]
+      [match.id, normalizedWinnerTeam, Math.floor(safeTeamAScore), Math.floor(safeTeamBScore), mapName || null, resultSource]
     );
 
     await client.query(`UPDATE match_players SET result_seen_at = NULL WHERE match_id = $1`, [match.id]);
@@ -520,12 +526,12 @@ async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBS
       eventType: 'match_finished',
       phase: 'finished',
       title: 'Match finished',
-      description: `Итоговый счёт ${teamAScore}:${teamBScore}.`,
-      metadata: { winnerTeam, teamAScore, teamBScore, mapName: mapName || null }
+      description: `Итоговый счёт ${Math.floor(safeTeamAScore)}:${Math.floor(safeTeamBScore)}.`,
+      metadata: { winnerTeam: normalizedWinnerTeam, teamAScore: Math.floor(safeTeamAScore), teamBScore: Math.floor(safeTeamBScore), mapName: mapName || null }
     });
   });
 
-  await applySimpleMatchElo(match.id, winnerTeam);
+  await applySimpleMatchElo(match.id, normalizedWinnerTeam);
 
   const players = await query(`SELECT user_id, party_id FROM match_players WHERE match_id = $1`, [match.id]);
   const touchedPartyIds = new Set();

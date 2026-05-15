@@ -16,8 +16,9 @@ function sign(value) {
 }
 
 function createAuthToken(userId) {
-  const exp = Date.now() + config.authTokenTtlDays * 24 * 60 * 60 * 1000;
-  const payload = JSON.stringify({ userId: Number(userId), exp });
+  const ttlDays = Number(config.authTokenTtlDays || 30);
+  const exp = Date.now() + ttlDays * 24 * 60 * 60 * 1000;
+  const payload = JSON.stringify({ userId: String(userId), exp });
   const encoded = b64urlEncode(payload);
   const signature = sign(encoded);
   return `${encoded}.${signature}`;
@@ -40,7 +41,7 @@ function verifyAuthToken(token) {
     return null;
   }
   if (!payload || !payload.userId || !payload.exp || Number(payload.exp) < Date.now()) return null;
-  return { userId: Number(payload.userId), exp: Number(payload.exp) };
+  return { userId: String(payload.userId), exp: Number(payload.exp) };
 }
 
 module.exports = { createAuthToken, verifyAuthToken };

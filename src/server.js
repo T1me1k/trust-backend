@@ -1,6 +1,7 @@
 const http = require('http');
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const session = require('express-session');
 const cookieParser = require('cookie-parser');
 const pgSession = require('connect-pg-simple')(session);
@@ -10,6 +11,37 @@ const { pool } = require('../src/db');
 const { initSchema } = require('../src/db/initSchema');
 const { runMatchmakingCycle } = require('../src/services/queueService');
 const { runLifecycleTick } = require('../src/services/lifecycleService');
+const { createRateLimiter } = require('../src/middleware/rateLimit');
+
+function patchExpressRouterAsyncHandlers() {
+  const originalRouterFactory = express.Router;
+  if (originalRouterFactory.__trustAsyncPatched) return;
+
+  function wrapAsyncHandler(handler) {
+    if (typeof handler !== 'function' || handler.length === 4 || handler.constructor.name !== 'AsyncFunction') return handler;
+    return function trustAsyncWrapper(req, res, next) {
+      return Promise.resolve(handler(req, res, next)).catch(next);
+    };
+  }
+
+  express.Router = function trustRouterFactory(...args) {
+    const router = originalRouterFactory.apply(express, args);
+    for (const method of ['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'use']) {
+      const originalMethod = router[method];
+      if (typeof originalMethod !== 'function') continue;
+      router[method] = function trustRouterMethod(path, ...handlers) {
+        if (typeof path === 'function') {
+          return originalMethod.call(this, wrapAsyncHandler(path), ...handlers.map(wrapAsyncHandler));
+        }
+        return originalMethod.call(this, path, ...handlers.map(wrapAsyncHandler));
+      };
+    }
+    return router;
+  };
+  express.Router.__trustAsyncPatched = true;
+}
+
+patchExpressRouterAsyncHandlers();
 
 const authRoutes = require('../src/routes/auth.routes');
 const accountRoutes = require('../src/routes/account.routes');
@@ -42,6 +74,8 @@ function setupCoreMiddleware() {
   const allowedOrigins = getAllowedOrigins();
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
+  app.use(helmet({ crossOriginResourcePolicy: false }));
+  app.use(createRateLimiter({ windowMs: 60_000, max: 300, keyPrefix: 'global' }));
   app.use(cors({
     origin(origin, callback) {
       if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) return callback(null, true);
@@ -72,15 +106,15 @@ function setupRoutes() {
   app.get('/health', (_req, res) => res.status(200).json({ ok: true, service: 'trust-backend', uptimeSec: Math.floor(process.uptime()), timestamp: new Date().toISOString() }));
   app.get('/config', (_req, res) => res.status(200).json({ ok: true, config: { appName: 'TRUST', latestVersion: '2.0.2', mode: process.env.DEFAULT_MATCH_MODE || config.defaultMatchMode || '2x2', region: process.env.DEFAULT_REGION || config.defaultRegion || 'EU', matchmakingEnabled: true } }));
 
-  app.use('/auth', authRoutes); app.use('/api/auth', authRoutes);
+  app.use('/auth', createRateLimiter({ windowMs: 60_000, max: 40, keyPrefix: 'auth' }), authRoutes); app.use('/api/auth', createRateLimiter({ windowMs: 60_000, max: 40, keyPrefix: 'api-auth' }), authRoutes);
   app.use('/account', accountRoutes); app.use('/api/account', accountRoutes);
-  app.use('/party', partyRoutes); app.use('/api/party', partyRoutes);
+  app.use('/party', createRateLimiter({ windowMs: 60_000, max: 120, keyPrefix: 'party' }), partyRoutes); app.use('/api/party', createRateLimiter({ windowMs: 60_000, max: 120, keyPrefix: 'api-party' }), partyRoutes);
   app.use('/queue', queueRoutes); app.use('/api/queue', queueRoutes);
   app.use('/matches', matchesRoutes); app.use('/api/matches', matchesRoutes);
-  app.use('/launcher', launcherRoutes); app.use('/api/launcher', launcherRoutes);
+  app.use('/launcher', createRateLimiter({ windowMs: 60_000, max: 50, keyPrefix: 'launcher' }), launcherRoutes); app.use('/api/launcher', createRateLimiter({ windowMs: 60_000, max: 50, keyPrefix: 'api-launcher' }), launcherRoutes);
   app.use('/leaderboard', leaderboardRoutes); app.use('/api/leaderboard', leaderboardRoutes);
   app.use('/profile', profileRoutes); app.use('/api/profile', profileRoutes);
-  app.use('/internal', internalRoutes);
+  app.use('/internal', createRateLimiter({ windowMs: 60_000, max: 600, keyPrefix: 'internal' }), internalRoutes);
 
   app.use((req, res) => res.status(404).json({ ok: false, error: 'not_found', path: req.originalUrl }));
   app.use((err, _req, res, _next) => {
@@ -122,6 +156,13 @@ async function gracefulShutdown(signal) {
   await new Promise((resolve) => server.close(resolve));
   process.exit(0);
 }
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[process] unhandled rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[process] uncaught exception:', err);
+});
 
 async function bootstrap() {
   try {

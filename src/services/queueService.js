@@ -96,10 +96,10 @@ async function ensureDefaultServer() {
 
   const insert = await query(
     `INSERT INTO server_instances (name, host, port, server_password, server_token, status, region, last_heartbeat_at)
-     VALUES ('default-local', $1, $2, $3, 'local-dev-token', 'idle', $4, NOW())
+     VALUES ('default-local', $1, $2, $3, $4, 'idle', $5, NOW())
      ON CONFLICT (host, port) DO UPDATE SET status = 'idle'
      RETURNING *`,
-    [config.defaultServerIp, config.defaultServerPort, config.defaultServerPassword, config.defaultRegion]
+    [config.defaultServerIp, config.defaultServerPort, config.defaultServerPassword, config.defaultServerToken, config.defaultRegion]
   );
   return insert.rows[0];
 }

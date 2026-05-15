@@ -41,7 +41,7 @@ function sanitizeReturnTo(rawValue) {
 function createLoginExchange(userId) {
   const token = crypto.randomBytes(32).toString('hex');
   loginExchangeStore.set(token, {
-    userId: Number(userId),
+    userId: String(userId),
     expiresAt: Date.now() + LOGIN_EXCHANGE_TTL_MS
   });
   return token;
@@ -53,6 +53,7 @@ function consumeLoginExchange(token) {
   if (!item) return null;
   loginExchangeStore.delete(token);
   if (!item.userId || item.expiresAt < Date.now()) return null;
+  item.userId = String(item.userId);
   return item;
 }
 
