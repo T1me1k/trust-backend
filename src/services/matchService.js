@@ -238,7 +238,6 @@ async function getCurrentMatchByUserId(userId) {
          OR m.status = 'live'
          OR (m.status = 'pending_acceptance' AND (m.accept_expires_at IS NULL OR m.accept_expires_at > NOW()))
          OR (m.status = 'server_assigned' AND (m.connect_expires_at IS NULL OR m.connect_expires_at > NOW()))
-         OR (m.status = 'cancelled' AND (m.finished_at IS NULL OR m.finished_at >= NOW() - INTERVAL '2 hours'))
        )
      ORDER BY COALESCE(m.finished_at, m.created_at) DESC
      LIMIT 1`,

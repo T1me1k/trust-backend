@@ -1,13 +1,94 @@
 const RANKS = [
-  { key: 'iron', name: 'Iron', minElo: 0, color: 'iron' },
-  { key: 'bronze', name: 'Bronze', minElo: 300, color: 'bronze' },
-  { key: 'silver', name: 'Silver', minElo: 500, color: 'silver' },
-  { key: 'gold_nova', name: 'Gold Nova', minElo: 700, color: 'gold' },
-  { key: 'master_guardian', name: 'Master Guardian', minElo: 900, color: 'guardian' },
-  { key: 'distinguished', name: 'Distinguished', minElo: 1100, color: 'distinguished' },
-  { key: 'legendary_eagle', name: 'Legendary Eagle', minElo: 1300, color: 'eagle' },
-  { key: 'supreme', name: 'Supreme', minElo: 1500, color: 'supreme' },
-  { key: 'global_elite', name: 'Global Elite', minElo: 1700, color: 'global' }
+  {
+    "key": "iron",
+    "name": "Iron",
+    "tierName": "Iron",
+    "division": null,
+    "minElo": 0,
+    "color": "iron",
+    "icon": "iron.svg"
+  },
+  {
+    "key": "bronze",
+    "name": "Bronze",
+    "tierName": "Bronze",
+    "division": null,
+    "minElo": 225,
+    "color": "bronze",
+    "icon": "bronze.svg"
+  },
+  {
+    "key": "silver",
+    "name": "Silver",
+    "tierName": "Silver",
+    "division": null,
+    "minElo": 450,
+    "color": "silver",
+    "icon": "silver.svg"
+  },
+  {
+    "key": "gold",
+    "name": "Gold",
+    "tierName": "Gold",
+    "division": null,
+    "minElo": 675,
+    "color": "gold",
+    "icon": "gold.svg"
+  },
+  {
+    "key": "platinum",
+    "name": "Platinum",
+    "tierName": "Platinum",
+    "division": null,
+    "minElo": 900,
+    "color": "platinum",
+    "icon": "platinum.svg"
+  },
+  {
+    "key": "diamond",
+    "name": "Diamond",
+    "tierName": "Diamond",
+    "division": null,
+    "minElo": 1125,
+    "color": "diamond",
+    "icon": "diamond.svg"
+  },
+  {
+    "key": "master",
+    "name": "Master",
+    "tierName": "Master",
+    "division": null,
+    "minElo": 1350,
+    "color": "master",
+    "icon": "master.svg"
+  },
+  {
+    "key": "grandmaster",
+    "name": "Grandmaster",
+    "tierName": "Grandmaster",
+    "division": null,
+    "minElo": 1575,
+    "color": "grandmaster",
+    "icon": "grandmaster.svg"
+  },
+  {
+    "key": "elite",
+    "name": "Elite",
+    "tierName": "Elite",
+    "division": null,
+    "minElo": 1800,
+    "color": "elite",
+    "icon": "elite.svg"
+  },
+  {
+    "key": "legend",
+    "name": "Legend",
+    "tierName": "Legend",
+    "division": null,
+    "minElo": 2000,
+    "color": "legend",
+    "icon": "legend.svg"
+  }
 ];
 
 function clampPercent(value) {
@@ -33,13 +114,19 @@ function getRankForElo(rawElo) {
   const progressPercent = nextFloor == null
     ? 100
     : clampPercent(((elo - currentFloor) / Math.max(1, nextFloor - currentFloor)) * 100);
+  const rp = nextFloor == null ? 100 : clampPercent(progressPercent);
 
   return {
     key: current.key,
     name: current.name,
+    tierName: current.tierName,
+    division: current.division,
     color: current.color,
+    icon: current.icon,
     minElo: current.minElo,
     currentElo: elo,
+    rating: elo,
+    rp,
     nextRankKey: next?.key || null,
     nextRankName: next?.name || null,
     nextRankElo: next?.minElo || null,

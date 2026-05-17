@@ -74,7 +74,58 @@ async function getIncomingInvitesByUserId(userId) {
   return result.rows.map(normalizeInvite);
 }
 
+
+async function healStalePartyForUser(userId) {
+  await withTransaction(async (client) => {
+    const partyResult = await client.query(
+      `SELECT p.id, p.status
+       FROM party_members pm
+       JOIN parties p ON p.id = pm.party_id
+       WHERE pm.user_id = $1 AND p.status IN ('searching', 'in_match')
+       ORDER BY p.created_at DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [userId]
+    );
+    const party = partyResult.rows[0];
+    if (!party) return;
+
+    if (party.status === 'searching') {
+      const queued = await client.query(
+        `SELECT id FROM queue_entries WHERE party_id = $1 AND status = 'queued' LIMIT 1`,
+        [party.id]
+      );
+      if (!queued.rows[0]) {
+        await client.query(`UPDATE parties SET status = 'open', updated_at = NOW() WHERE id = $1`, [party.id]);
+      }
+      return;
+    }
+
+    if (party.status === 'in_match') {
+      const activeMatch = await client.query(
+        `SELECT m.id
+         FROM match_players mp
+         JOIN matches m ON m.id = mp.match_id
+         WHERE mp.party_id = $1
+           AND (
+             m.status = 'map_voting'
+             OR m.status = 'live'
+             OR (m.status = 'pending_acceptance' AND (m.accept_expires_at IS NULL OR m.accept_expires_at > NOW()))
+             OR (m.status = 'server_assigned' AND (m.connect_expires_at IS NULL OR m.connect_expires_at > NOW()))
+           )
+         LIMIT 1`,
+        [party.id]
+      );
+      if (!activeMatch.rows[0]) {
+        await client.query(`UPDATE parties SET status = 'open', updated_at = NOW() WHERE id = $1`, [party.id]);
+        await client.query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status <> 'cancelled'`, [party.id]);
+      }
+    }
+  });
+}
+
 async function getCurrentPartyByUserId(userId) {
+  await healStalePartyForUser(userId);
   const partyResult = await query(
     `SELECT p.*
      FROM party_members pm
@@ -182,7 +233,7 @@ async function inviteToParty({ actorUserId, targetUserId }) {
 
   const result = await query(
     `INSERT INTO party_invites (party_id, from_user_id, to_user_id, status, created_at, expires_at)
-     VALUES ($1, $2, $3, 'pending', NOW(), NOW() + INTERVAL '10 seconds')
+     VALUES ($1, $2, $3, 'pending', NOW(), NOW() + INTERVAL '60 seconds')
      RETURNING *`,
     [party.id, actorUserId, targetUserId]
   );
@@ -245,6 +296,7 @@ async function leaveParty(userId) {
 
   await withTransaction(async (client) => {
     await client.query(`DELETE FROM party_members WHERE party_id = $1 AND user_id = $2`, [party.id, userId]);
+    await client.query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status = 'queued'`, [party.id]);
     const members = await client.query(`SELECT user_id FROM party_members WHERE party_id = $1 ORDER BY joined_at ASC`, [party.id]);
 
     if (members.rows.length === 0) {
@@ -253,6 +305,8 @@ async function leaveParty(userId) {
       await client.query(`UPDATE party_invites SET status = 'cancelled' WHERE party_id = $1 AND status = 'pending'`, [party.id]);
       return;
     }
+
+    await client.query(`UPDATE parties SET status = 'open', updated_at = NOW() WHERE id = $1 AND status = 'searching'`, [party.id]);
 
     if (party.leader_user_id === userId) {
       const newLeaderId = members.rows[0].user_id;
@@ -294,5 +348,6 @@ module.exports = {
   acceptInvite,
   declineInvite,
   leaveParty,
-  disbandParty
+  disbandParty,
+  healStalePartyForUser
 };

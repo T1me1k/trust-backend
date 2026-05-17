@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const config = require('../config');
 const { query, withTransaction } = require('../db');
-const { createParty, getCurrentPartyByUserId } = require('./partyService');
+const { createParty, getCurrentPartyByUserId, healStalePartyForUser } = require('./partyService');
 const { setPresence } = require('./accountService');
 const { assertCanQueue, getRestrictionState } = require('./restrictionsService');
 
@@ -41,6 +41,9 @@ async function getPartyForQueue(userId) {
 }
 
 async function joinQueue(userId) {
+  const existingQueue = await getQueueState(userId);
+  if (existingQueue) return existingQueue;
+  await healStalePartyForUser(userId);
   await assertCanQueue(userId);
   const party = await getPartyForQueue(userId);
   if (!party?.id) throw new Error('party_not_found');
@@ -75,8 +78,9 @@ async function joinQueue(userId) {
 }
 
 async function cancelQueue(userId) {
+  await healStalePartyForUser(userId);
   const party = await getCurrentPartyByUserId(userId);
-  if (!party?.id) throw new Error('party_not_found');
+  if (!party?.id) return true;
   if (party.leader_user_id !== userId) throw new Error('not_party_leader');
 
   await query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status = 'queued'`, [party.id]);
