@@ -90,6 +90,14 @@ async function getProfileSummaryByUserId(userId) {
   const favoriteMap = favoriteMapResult.rows[0] || null;
   const wins = Number(base.wins_2v2 || 0);
   const elo2v2 = Number(base.elo_2v2 || 100);
+
+  const leaderboardPositionResult = await query(
+    `SELECT 1 + COUNT(*)::int AS position
+     FROM player_profiles
+     WHERE COALESCE(elo_2v2, 100) > $1`,
+    [elo2v2]
+  );
+  const leaderboardPosition = Number(leaderboardPositionResult.rows[0]?.position || 1);
   const losses = Number(base.losses_2v2 || 0);
   const matchesPlayed = Number(base.matches_played_2v2 || 0);
   const completedMatches = wins + losses;
@@ -113,6 +121,7 @@ async function getProfileSummaryByUserId(userId) {
     bestWinStreak: streaks.bestWinStreak,
     favoriteMap: favoriteMap?.map_name || null,
     favoriteMapMatches: Number(favoriteMap?.matches || 0),
+    leaderboardPosition,
     recentForm,
     standing: standingFromWinRate(winRate, matchesPlayed),
     lastMatchAt: base.last_match_at || null
