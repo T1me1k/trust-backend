@@ -40,11 +40,18 @@ async function getPartyForQueue(userId) {
   return party;
 }
 
-async function joinQueue(userId) {
-  const existingQueue = await getQueueState(userId);
-  if (existingQueue) return existingQueue;
+function normalizeQueueMode(mode) {
+  const normalized = String(mode || config.defaultMatchMode || '2x2').trim().toLowerCase();
+  if (normalized !== '2x2') throw new Error('unsupported_queue_mode');
+  return '2x2';
+}
+
+async function joinQueue(userId, mode = '2x2') {
+  const queueMode = normalizeQueueMode(mode);
   await healStalePartyForUser(userId);
   await assertCanQueue(userId);
+  const existingQueue = await getQueueState(userId);
+  if (existingQueue) return existingQueue;
   const party = await getPartyForQueue(userId);
   if (!party?.id) throw new Error('party_not_found');
   if (party.leader_user_id !== userId) throw new Error('not_party_leader');
@@ -55,18 +62,18 @@ async function joinQueue(userId) {
   await withTransaction(async (client) => {
     await client.query(
       `INSERT INTO queue_entries (party_id, leader_user_id, mode, status, queued_at)
-       VALUES ($1, $2, '2x2', 'queued', NOW())
+       VALUES ($1, $2, $3, 'queued', NOW())
        ON CONFLICT (party_id)
        DO UPDATE SET leader_user_id = EXCLUDED.leader_user_id,
                      mode = EXCLUDED.mode,
                      status = 'queued',
                      queued_at = NOW(),
                      matched_at = NULL`,
-      [party.id, userId]
+      [party.id, userId, queueMode]
     );
     await client.query(
-      `UPDATE parties SET status = 'searching', queue_mode = '2x2', updated_at = NOW() WHERE id = $1`,
-      [party.id]
+      `UPDATE parties SET status = 'searching', queue_mode = $2, updated_at = NOW() WHERE id = $1`,
+      [party.id, queueMode]
     );
   });
 
@@ -82,12 +89,23 @@ async function cancelQueue(userId) {
   const party = await getCurrentPartyByUserId(userId);
   if (!party?.id) return true;
   if (party.leader_user_id !== userId) throw new Error('not_party_leader');
+  if (party.status === 'in_match') throw new Error('cannot_cancel_active_match');
 
-  await query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status = 'queued'`, [party.id]);
-  await query(`UPDATE parties SET status = 'open', updated_at = NOW() WHERE id = $1`, [party.id]);
+  const result = await withTransaction(async (client) => {
+    const queueResult = await client.query(
+      `UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status = 'queued'`,
+      [party.id]
+    );
+    if (queueResult.rowCount > 0 || party.status === 'searching') {
+      await client.query(`UPDATE parties SET status = 'open', updated_at = NOW() WHERE id = $1 AND status = 'searching'`, [party.id]);
+    }
+    return queueResult.rowCount;
+  });
 
-  for (const member of party.members) {
-    await setPresence(member.userId, 'in_party', party.id, null);
+  if (result > 0 || party.status === 'searching') {
+    for (const member of party.members) {
+      await setPresence(member.userId, 'in_party', party.id, null);
+    }
   }
   return true;
 }
