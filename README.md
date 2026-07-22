@@ -169,3 +169,25 @@ Returns total matches, wins, losses, winrate, kills, deaths, assists, K/D, avera
 ### Match Center storage migration
 
 Apply the latest schema updates before deploying the SourceMod plugin changes. The schema adds `matches.duration_seconds`, per-player stat columns on `match_players`, and the `match_rounds` table with a unique `(match_id, round_number)` constraint.
+
+#### Match telemetry API contracts
+
+`GET /api/matches/:matchId` is public and returns `{ ok: true, match: { ... } }`; `match.id` is the public match id used by `match.html?id=<id>`. Completed matches are exposed as `status: "completed"` with `rawStatus: "finished"` for compatibility with the database lifecycle. Player rows are sorted by TRUST team and slot, include current Steam nickname/avatar, rank computed from post-match Elo/current Elo, flattened telemetry fields, `eloBefore`, `eloAfter`, `eloChange`, `isMatchMvp`, and `hasDetailedStats`. Round rows are sorted by `roundNumber` and include `reasonLabel`. Server tokens and server passwords are intentionally not returned. Missing matches return `404 { "ok": false, "error": "match_not_found" }`.
+
+`GET /api/players/:steamId/matches?page=1&limit=20` returns `{ ok: true, items, page, limit, total, totalPages }`. `limit` is capped at 50. Each item includes `id`, `status`, `map`, `playedAt`, `team`, `winnerTeam`, `result` (`win`, `loss`, `draw`, or `pending`), relative score, compact K/D/A, `eloChange`, `isMatchMvp`, and `hasDetailedStats` so frontend can open `/match.html?id=${id}`.
+
+`GET /api/players/:steamId/stats` returns `{ ok: true, matches, wins, losses, draws, winrate, kills, deaths, assists, kd, headshots, headshotRate, damage, averageDamagePerMatch, averageDamagePerRound, matchMvpCount, currentStreak, bestWinStreak, maps }`. Aggregates include only finished matches where the Steam account was an actual participant. Legacy finished matches without telemetry count toward `matches`, `wins`, `losses`, `draws`, streaks, and map winrate, but are excluded from K/D, headshot, MVP and average-damage numerators/denominators via `hasDetailedStats`, so old data does not pollute telemetry averages. Empty profiles return zero-safe values and an empty `maps` array.
+
+Frontend examples:
+
+```js
+const match = await fetch(`/api/matches/${encodeURIComponent(matchId)}`).then((r) => r.json());
+const history = await fetch(`/api/players/${steamId}/matches?page=1&limit=20`).then((r) => r.json());
+const stats = await fetch(`/api/players/${steamId}/stats`).then((r) => r.json());
+```
+
+Run schema updates with the app startup initializer or manually in a test database:
+
+```bash
+DATABASE_URL=postgres://user:pass@localhost:5432/trust_test node -e "require('./src/db/initSchema').initSchema().then(()=>process.exit(0)).catch(()=>process.exit(1))"
+```

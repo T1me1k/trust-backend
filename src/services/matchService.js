@@ -576,7 +576,7 @@ async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBS
     const matchResult = await client.query(`SELECT id, status, server_id, result_source FROM matches WHERE public_match_id = $1 LIMIT 1 FOR UPDATE`, [publicMatchId]);
     const match = matchResult.rows[0];
     if (!match) throw new Error('match_not_found');
-    if (match.status === 'finished') return { alreadyFinished: true, duplicate: true, resultSource: match.result_source || null };
+    if (match.status === 'finished') return { alreadyProcessed: true, alreadyFinished: true, duplicate: true, resultSource: match.result_source || null };
     if (match.status === 'cancelled') throw new Error('match_cancelled');
     if (!['server_assigned', 'live'].includes(match.status)) throw new Error('match_not_live');
     if (serverId && match.server_id && String(match.server_id) !== String(serverId)) throw new Error('server_mismatch');
@@ -613,7 +613,7 @@ async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBS
       await client.query(
         `UPDATE match_players
          SET kills=$3, deaths=$4, assists=$5, headshots=$6, damage=$7, mvps=$8,
-             first_kills=$9, clutches=$10, performance_score=$11, is_match_mvp=$12
+             first_kills=$9, clutches=$10, performance_score=$11, is_match_mvp=$12, has_detailed_stats=TRUE
          WHERE match_id=$1 AND user_id=$2`,
         [match.id, rosterPlayer.user_id, player.kills, player.deaths, player.assists, player.headshots, player.damage, player.mvps, player.firstKills, player.clutches, performanceScore(player), !!mvp && mvp.steamId === player.steamId]
       );

@@ -11,7 +11,7 @@ router.get('/:steamId/matches', async (req, res) => {
 
 router.get('/:steamId/stats', async (req, res) => {
   const stats = await getPlayerAggregatedStatsBySteamId(req.params.steamId);
-  return ok(res, { stats });
+  return ok(res, stats);
 });
 
 module.exports = router;
