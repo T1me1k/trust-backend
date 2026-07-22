@@ -248,3 +248,32 @@ CREATE INDEX IF NOT EXISTS idx_matches_status_connect_deadline ON matches(status
 CREATE INDEX IF NOT EXISTS idx_matches_status_accept_deadline ON matches(status, accept_expires_at);
 CREATE INDEX IF NOT EXISTS idx_matches_server_status_created ON matches(server_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_match_issue_reports_player_created ON match_issue_reports(player_id, created_at DESC);
+
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;
+
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS kills INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS deaths INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS assists INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS headshots INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS damage INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS mvps INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS first_kills INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS clutches INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS performance_score NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE match_players ADD COLUMN IF NOT EXISTS is_match_mvp BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS match_rounds (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  match_id UUID NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  round_number INTEGER NOT NULL,
+  winner_team TEXT NOT NULL,
+  reason TEXT,
+  team_a_score INTEGER NOT NULL DEFAULT 0,
+  team_b_score INTEGER NOT NULL DEFAULT 0,
+  duration_seconds INTEGER,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (match_id, round_number),
+  CONSTRAINT match_rounds_winner_team_check CHECK (winner_team IN ('A','B'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_match_rounds_match_round ON match_rounds(match_id, round_number);
