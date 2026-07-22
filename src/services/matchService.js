@@ -1,6 +1,6 @@
 const config = require('../config');
 const { query, withTransaction } = require('../db');
-const { applySimpleMatchElo } = require('./eloService');
+const { applySimpleMatchEloWithClient } = require('./eloService');
 const { setPresence } = require('./accountService');
 const { logMatchEvent, normalizeFinishReason, finishReasonLabel, FINISH_REASONS } = require('./matchRoomService');
 
@@ -493,61 +493,160 @@ async function submitMatchIssue({ userId, publicMatchId, phase, reason, comment 
   });
 }
 
-async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBScore, mapName, resultSource = 'server_plugin' }) {
+
+function performanceScore(stats) {
+  return (Number(stats.kills || 0) * 2)
+    + Number(stats.assists || 0)
+    + (Number(stats.headshots || 0) * 0.5)
+    + (Number(stats.damage || 0) / 100)
+    + Number(stats.mvps || 0)
+    + Number(stats.firstKills || 0)
+    + (Number(stats.clutches || 0) * 2)
+    - Number(stats.deaths || 0);
+}
+
+function nonNegativeInt(value, fieldName, defaultValue = 0) {
+  if (value == null || value === '') return defaultValue;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) throw new Error(`invalid_${fieldName}`);
+  return Math.floor(number);
+}
+
+function normalizeSubmittedPlayer(raw) {
+  const steamId = String(raw?.steamId || '').trim();
+  const team = String(raw?.team || '').trim().toUpperCase();
+  if (!steamId) throw new Error('invalid_player_steam_id');
+  if (!['A', 'B'].includes(team)) throw new Error('invalid_player_team');
+  return {
+    steamId,
+    team,
+    kills: nonNegativeInt(raw.kills, 'player_stats'),
+    deaths: nonNegativeInt(raw.deaths, 'player_stats'),
+    assists: nonNegativeInt(raw.assists, 'player_stats'),
+    headshots: nonNegativeInt(raw.headshots, 'player_stats'),
+    damage: nonNegativeInt(raw.damage, 'player_stats'),
+    mvps: nonNegativeInt(raw.mvps, 'player_stats'),
+    firstKills: nonNegativeInt(raw.firstKills, 'player_stats'),
+    clutches: nonNegativeInt(raw.clutches, 'player_stats')
+  };
+}
+
+function pickMatchMvp(players) {
+  if (!players.length) return null;
+  return [...players].sort((a, b) => {
+    const scoreDiff = performanceScore(b) - performanceScore(a);
+    if (scoreDiff !== 0) return scoreDiff;
+    if (b.damage !== a.damage) return b.damage - a.damage;
+    if (b.kills !== a.kills) return b.kills - a.kills;
+    if (a.deaths !== b.deaths) return a.deaths - b.deaths;
+    return a.steamId.localeCompare(b.steamId);
+  })[0];
+}
+
+function normalizeSubmittedRound(raw) {
+  const winnerTeam = String(raw?.winnerTeam || '').trim().toUpperCase();
+  if (!['A', 'B'].includes(winnerTeam)) throw new Error('invalid_round_winner_team');
+  return {
+    roundNumber: nonNegativeInt(raw.roundNumber, 'round_number'),
+    winnerTeam,
+    reason: String(raw.reason || '').trim().slice(0, 64) || null,
+    teamAScore: nonNegativeInt(raw.teamAScore, 'round_score'),
+    teamBScore: nonNegativeInt(raw.teamBScore, 'round_score'),
+    durationSeconds: raw.durationSeconds == null ? null : nonNegativeInt(raw.durationSeconds, 'round_duration')
+  };
+}
+
+async function submitMatchResult({ publicMatchId, winnerTeam, teamAScore, teamBScore, mapName, durationSeconds, serverId, players = null, rounds = null, resultSource = 'server_plugin' }) {
   const normalizedWinnerTeam = String(winnerTeam || '').trim().toUpperCase();
-  const safeTeamAScore = Number(teamAScore);
-  const safeTeamBScore = Number(teamBScore);
+  const safeTeamAScore = nonNegativeInt(teamAScore, 'score');
+  const safeTeamBScore = nonNegativeInt(teamBScore, 'score');
   if (!['A', 'B'].includes(normalizedWinnerTeam)) throw new Error('invalid_winner_team');
-  if (!Number.isFinite(safeTeamAScore) || !Number.isFinite(safeTeamBScore) || safeTeamAScore < 0 || safeTeamBScore < 0) throw new Error('invalid_score');
+  if ((normalizedWinnerTeam === 'A' && safeTeamAScore <= safeTeamBScore) || (normalizedWinnerTeam === 'B' && safeTeamBScore <= safeTeamAScore)) throw new Error('winner_score_mismatch');
+  const normalizedPlayers = Array.isArray(players) ? players.map(normalizeSubmittedPlayer) : [];
+  const normalizedRounds = Array.isArray(rounds) ? rounds.map(normalizeSubmittedRound) : [];
+  if (normalizedPlayers.length > 4) throw new Error('too_many_players');
+  const seen = new Set();
+  for (const player of normalizedPlayers) {
+    if (seen.has(player.steamId)) throw new Error('duplicate_player');
+    seen.add(player.steamId);
+  }
+  const safeDurationSeconds = durationSeconds == null ? null : nonNegativeInt(durationSeconds, 'duration');
 
-  const matchResult = await query(`SELECT id, status, server_id, result_source FROM matches WHERE public_match_id = $1 LIMIT 1`, [publicMatchId]);
-  const match = matchResult.rows[0];
-  if (!match) throw new Error('match_not_found');
-  if (match.status === 'finished') return { alreadyFinished: true, duplicate: true, resultSource: match.result_source || null };
-  if (!['server_assigned', 'live'].includes(match.status)) throw new Error('match_not_live');
+  return withTransaction(async (client) => {
+    const matchResult = await client.query(`SELECT id, status, server_id, result_source FROM matches WHERE public_match_id = $1 LIMIT 1 FOR UPDATE`, [publicMatchId]);
+    const match = matchResult.rows[0];
+    if (!match) throw new Error('match_not_found');
+    if (match.status === 'finished') return { alreadyFinished: true, duplicate: true, resultSource: match.result_source || null };
+    if (match.status === 'cancelled') throw new Error('match_cancelled');
+    if (!['server_assigned', 'live'].includes(match.status)) throw new Error('match_not_live');
+    if (serverId && match.server_id && String(match.server_id) !== String(serverId)) throw new Error('server_mismatch');
 
-  await withTransaction(async (client) => {
+    const rosterRes = await client.query(
+      `SELECT mp.user_id, mp.team, u.steam_id
+       FROM match_players mp JOIN users u ON u.id = mp.user_id
+       WHERE mp.match_id = $1 ORDER BY mp.team, mp.slot_index`, [match.id]
+    );
+    if (rosterRes.rows.length > 4) throw new Error('too_many_match_players');
+    const roster = new Map(rosterRes.rows.map((row) => [String(row.steam_id), row]));
+    for (const player of normalizedPlayers) {
+      const rosterPlayer = roster.get(player.steamId);
+      if (!rosterPlayer) throw new Error('player_not_in_match');
+      if (rosterPlayer.team !== player.team) throw new Error('player_team_mismatch');
+    }
+
     await client.query(
       `UPDATE matches
        SET status = 'finished', winner_team = $2, team_a_score = $3, team_b_score = $4,
            map_name = COALESCE($5, map_name), result_source = $6, finished_at = NOW(), result_ack_required = TRUE,
-           finish_reason = 'finished', final_message = 'Результат записан и доступен в Match Room.'
+           finish_reason = 'finished', final_message = 'Результат записан и доступен в Match Room.',
+           duration_seconds = COALESCE($7, duration_seconds), server_id = COALESCE($8, server_id)
        WHERE id = $1`,
-      [match.id, normalizedWinnerTeam, Math.floor(safeTeamAScore), Math.floor(safeTeamBScore), mapName || null, resultSource]
+      [match.id, normalizedWinnerTeam, safeTeamAScore, safeTeamBScore, mapName || null, resultSource, safeDurationSeconds, serverId || null]
     );
 
     await client.query(`UPDATE match_players SET result_seen_at = NULL WHERE match_id = $1`, [match.id]);
-    if (match.server_id) {
-      await client.query(`UPDATE server_instances SET status = 'idle', last_heartbeat_at = NOW() WHERE id = $1`, [match.server_id]);
+    await applySimpleMatchEloWithClient(client, match.id, normalizedWinnerTeam);
+
+    const mvp = pickMatchMvp(normalizedPlayers);
+    for (const player of normalizedPlayers) {
+      const rosterPlayer = roster.get(player.steamId);
+      await client.query(
+        `UPDATE match_players
+         SET kills=$3, deaths=$4, assists=$5, headshots=$6, damage=$7, mvps=$8,
+             first_kills=$9, clutches=$10, performance_score=$11, is_match_mvp=$12
+         WHERE match_id=$1 AND user_id=$2`,
+        [match.id, rosterPlayer.user_id, player.kills, player.deaths, player.assists, player.headshots, player.damage, player.mvps, player.firstKills, player.clutches, performanceScore(player), !!mvp && mvp.steamId === player.steamId]
+      );
     }
-    await logMatchEvent(client, {
-      matchId: match.id,
-      eventType: 'match_finished',
-      phase: 'finished',
-      title: 'Match finished',
-      description: `Итоговый счёт ${Math.floor(safeTeamAScore)}:${Math.floor(safeTeamBScore)}.`,
-      metadata: { winnerTeam: normalizedWinnerTeam, teamAScore: Math.floor(safeTeamAScore), teamBScore: Math.floor(safeTeamBScore), mapName: mapName || null }
-    });
+    if (normalizedRounds.length) {
+      await client.query(`DELETE FROM match_rounds WHERE match_id = $1`, [match.id]);
+      for (const round of normalizedRounds) {
+        await client.query(
+          `INSERT INTO match_rounds (match_id, round_number, winner_team, reason, team_a_score, team_b_score, duration_seconds)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [match.id, round.roundNumber, round.winnerTeam, round.reason, round.teamAScore, round.teamBScore, round.durationSeconds]
+        );
+      }
+    }
+    if (match.server_id || serverId) {
+      await client.query(`UPDATE server_instances SET status = 'idle', last_heartbeat_at = NOW() WHERE id::text = $1`, [String(serverId || match.server_id)]);
+    }
+    const partyRows = await client.query(`SELECT user_id, party_id FROM match_players WHERE match_id = $1`, [match.id]);
+    const touchedPartyIds = new Set();
+    for (const row of partyRows.rows) {
+      if (row.party_id) touchedPartyIds.add(row.party_id);
+      await client.query(
+        `UPDATE presence SET state = $2, current_party_id = $3, current_match_id = NULL, updated_at = NOW() WHERE user_id = $1`,
+        [row.user_id, row.party_id ? 'in_party' : 'online', row.party_id || null]
+      );
+    }
+    for (const partyId of touchedPartyIds) {
+      await client.query(`UPDATE parties SET status = 'open', updated_at = NOW() WHERE id = $1`, [partyId]);
+      await client.query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status <> 'cancelled'`, [partyId]);
+    }
+    await logMatchEvent(client, { matchId: match.id, eventType: 'match_finished', phase: 'finished', title: 'Match finished', description: `Победила команда ${normalizedWinnerTeam}.`, metadata: { teamAScore: safeTeamAScore, teamBScore: safeTeamBScore, mvpSteamId: mvp?.steamId || null } });
+    return { finished: true, alreadyFinished: false, duplicate: false, mvpSteamId: mvp?.steamId || null };
   });
-
-  await applySimpleMatchElo(match.id, normalizedWinnerTeam);
-
-  const players = await query(`SELECT user_id, party_id FROM match_players WHERE match_id = $1`, [match.id]);
-  const touchedPartyIds = new Set();
-  for (const row of players.rows) if (row.party_id) touchedPartyIds.add(row.party_id);
-
-  for (const row of players.rows) {
-    const nextPartyId = row.party_id || null;
-    const nextState = nextPartyId ? 'in_party' : 'online';
-    await setPresence(row.user_id, nextState, nextPartyId, null);
-  }
-
-  for (const partyId of touchedPartyIds) {
-    await query(`UPDATE parties SET status = 'open', updated_at = NOW() WHERE id = $1`, [partyId]);
-    await query(`UPDATE queue_entries SET status = 'cancelled' WHERE party_id = $1 AND status <> 'cancelled'`, [partyId]);
-  }
-
-  return { alreadyFinished: false };
 }
 
 async function getPendingPostMatchSummary(userId) {
@@ -609,6 +708,8 @@ module.exports = {
   MAP_POOL,
   ISSUE_REASONS,
   FINISH_REASONS,
+  performanceScore,
+  pickMatchMvp,
   getCurrentMatchByUserId,
   getMatchRoomByPublicId,
   getMatchHistory,

@@ -1,7 +1,6 @@
 const { withTransaction } = require('../db');
 
-async function applySimpleMatchElo(matchDbId, winnerTeam) {
-  return withTransaction(async (client) => {
+async function applySimpleMatchEloWithClient(client, matchDbId, winnerTeam) {
     const playersResult = await client.query(
       `SELECT mp.user_id, mp.team, p.elo_2v2
        FROM match_players mp
@@ -37,7 +36,10 @@ async function applySimpleMatchElo(matchDbId, winnerTeam) {
         [row.user_id, after, result]
       );
     }
-  });
 }
 
-module.exports = { applySimpleMatchElo };
+async function applySimpleMatchElo(matchDbId, winnerTeam) {
+  return withTransaction((client) => applySimpleMatchEloWithClient(client, matchDbId, winnerTeam));
+}
+
+module.exports = { applySimpleMatchElo, applySimpleMatchEloWithClient };

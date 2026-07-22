@@ -240,14 +240,20 @@ router.get('/server/result-config-text', async (req, res) => {
 
 router.post('/server/result', async (req, res) => {
   try {
-    const { matchId, winnerTeam, teamAScore, teamBScore, map } = req.body || {};
+    const { matchId, winnerTeam, teamAScore, teamBScore, map, durationSeconds, serverId, players, rounds } = req.body || {};
     if (!matchId || !winnerTeam) return fail(res, 400, 'missing_fields');
-    const normalizedWinnerTeam = String(winnerTeam).trim().toUpperCase();
-    if (!['A', 'B'].includes(normalizedWinnerTeam)) return fail(res, 400, 'invalid_winner_team');
-    const safeTeamAScore = Number(teamAScore);
-    const safeTeamBScore = Number(teamBScore);
-    if (!Number.isFinite(safeTeamAScore) || !Number.isFinite(safeTeamBScore) || safeTeamAScore < 0 || safeTeamBScore < 0) return fail(res, 400, 'invalid_score');
-    const result = await submitMatchResult({ publicMatchId: String(matchId), winnerTeam: normalizedWinnerTeam, teamAScore: Math.floor(safeTeamAScore), teamBScore: Math.floor(safeTeamBScore), mapName: String(map || ''), resultSource: 'server_plugin' });
+    const result = await submitMatchResult({
+      publicMatchId: String(matchId),
+      winnerTeam,
+      teamAScore,
+      teamBScore,
+      mapName: String(map || ''),
+      durationSeconds,
+      serverId: serverId == null ? req.trustServer.id : String(serverId),
+      players,
+      rounds,
+      resultSource: 'server_plugin'
+    });
     return ok(res, result);
   } catch (err) { return fail(res, 400, err.message || 'result_submit_failed'); }
 });

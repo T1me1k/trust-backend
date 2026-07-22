@@ -51,6 +51,7 @@ const matchesRoutes = require('../src/routes/matches.routes');
 const launcherRoutes = require('../src/routes/launcher.routes');
 const leaderboardRoutes = require('../src/routes/leaderboard.routes');
 const profileRoutes = require('../src/routes/profile.routes');
+const playersRoutes = require('../src/routes/players.routes');
 const internalRoutes = require('./routes/internal.routes');
 
 const PORT = Number(process.env.PORT || config.port || 3000);
@@ -114,6 +115,7 @@ function setupRoutes() {
   app.use('/launcher', createRateLimiter({ windowMs: 60_000, max: 50, keyPrefix: 'launcher' }), launcherRoutes); app.use('/api/launcher', createRateLimiter({ windowMs: 60_000, max: 50, keyPrefix: 'api-launcher' }), launcherRoutes);
   app.use('/leaderboard', leaderboardRoutes); app.use('/api/leaderboard', leaderboardRoutes);
   app.use('/profile', profileRoutes); app.use('/api/profile', profileRoutes);
+  app.use('/players', playersRoutes); app.use('/api/players', playersRoutes);
   app.use('/internal', createRateLimiter({ windowMs: 60_000, max: 600, keyPrefix: 'internal' }), internalRoutes);
 
   app.use((req, res) => res.status(404).json({ ok: false, error: 'not_found', path: req.originalUrl }));

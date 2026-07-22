@@ -14,9 +14,16 @@ const {
   ISSUE_REASONS,
   FINISH_REASONS
 } = require('../services/matchService');
-const { getMatchDetailsForUser } = require('../services/profileService');
+const { getMatchDetailsForUser, getMatchDetails } = require('../services/profileService');
 
 const router = express.Router();
+
+router.get('/:matchId', async (req, res) => {
+  const match = await getMatchDetails(req.params.matchId);
+  if (!match) return fail(res, 404, 'match_not_found');
+  return ok(res, { match });
+});
+
 router.use(requireAuth);
 
 router.get('/me/current', async (req, res) => {
