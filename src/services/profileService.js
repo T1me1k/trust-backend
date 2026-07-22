@@ -304,89 +304,117 @@ async function getMatchDetailsForUser({ publicMatchId, viewerUserId }) {
 }
 
 
-function buildPlayerMatchStats(row) {
+function round2(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return 0;
+  return Math.round(number * 100) / 100;
+}
+
+function toIso(value) { return value ? new Date(value).toISOString() : null; }
+function validSteamId(steamId) { return /^[0-9]{17}$/.test(String(steamId || '')); }
+function normalizeResult(status, winnerTeam, team) {
+  if (status !== 'finished') return 'pending';
+  if (!winnerTeam) return 'draw';
+  if (!team) return 'pending';
+  return winnerTeam === team ? 'win' : 'loss';
+}
+function reasonLabel(reason) {
+  const labels = { 7: 'elimination', 8: 'bomb_defused', 9: 'bomb_exploded', 12: 'time_expired' };
+  return labels[String(reason)] || (reason == null ? null : String(reason));
+}
+
+function flatStats(row) {
+  if (!row.has_detailed_stats) {
+    return { kills:null, deaths:null, assists:null, headshots:null, damage:null, mvps:null, firstKills:null, clutches:null };
+  }
   return {
-    kills: Number(row.kills || 0), deaths: Number(row.deaths || 0), assists: Number(row.assists || 0),
-    headshots: Number(row.headshots || 0), damage: Number(row.damage || 0), mvps: Number(row.mvps || 0),
-    firstKills: Number(row.first_kills || 0), clutches: Number(row.clutches || 0),
-    performanceScore: Number(row.performance_score || 0)
+    kills:Number(row.kills || 0), deaths:Number(row.deaths || 0), assists:Number(row.assists || 0),
+    headshots:Number(row.headshots || 0), damage:Number(row.damage || 0), mvps:Number(row.mvps || 0),
+    firstKills:Number(row.first_kills || 0), clutches:Number(row.clutches || 0)
   };
 }
 
 async function getMatchDetails(publicMatchId) {
+  if (!publicMatchId || String(publicMatchId).length > 128) return null;
   const matchRes = await query(
     `SELECT m.id, m.public_match_id, m.mode, m.status, m.map_name, m.team_a_score, m.team_b_score, m.winner_team,
-            m.started_at, m.finished_at, m.created_at, m.duration_seconds, m.server_id, si.name AS server_name, si.region AS server_region
+            m.started_at, m.finished_at, m.created_at, m.duration_seconds, si.name AS server_name, si.region AS server_region
      FROM matches m LEFT JOIN server_instances si ON si.id::text = m.server_id
-     WHERE m.public_match_id = $1 LIMIT 1`, [publicMatchId]
+     WHERE m.public_match_id = $1 LIMIT 1`, [String(publicMatchId)]
   );
   const match = matchRes.rows[0] || null;
   if (!match) return null;
   const playersRes = await query(
-    `SELECT mp.*, u.steam_id, u.persona_name, u.avatar_full_url, COALESCE(pp.elo_2v2,100) AS elo_2v2
+    `SELECT mp.user_id, mp.team, mp.slot_index, mp.elo_before, mp.elo_after, mp.elo_delta, mp.result,
+            mp.kills, mp.deaths, mp.assists, mp.headshots, mp.damage, mp.mvps, mp.first_kills, mp.clutches,
+            mp.is_match_mvp, mp.has_detailed_stats, u.steam_id, u.persona_name, u.avatar_full_url, COALESCE(pp.elo_2v2,100) AS elo_2v2
      FROM match_players mp JOIN users u ON u.id=mp.user_id LEFT JOIN player_profiles pp ON pp.user_id=mp.user_id
-     WHERE mp.match_id=$1 ORDER BY mp.team, mp.slot_index`, [match.id]
+     WHERE mp.match_id=$1 ORDER BY mp.team ASC, mp.slot_index ASC, u.steam_id ASC`, [match.id]
   );
   const roundsRes = await query(
-    `SELECT round_number, winner_team, reason, team_a_score, team_b_score, duration_seconds FROM match_rounds WHERE match_id=$1 ORDER BY round_number`, [match.id]
+    `SELECT round_number, winner_team, reason, team_a_score, team_b_score, duration_seconds FROM match_rounds WHERE match_id=$1 ORDER BY round_number ASC`, [match.id]
   );
-  const players = playersRes.rows.map((row) => ({
-    userId: row.user_id, steamId: row.steam_id, team: row.team, slotIndex: Number(row.slot_index || 0),
-    nickname: row.persona_name, avatarUrl: row.avatar_full_url || null,
-    rank: getRankForElo(Number(row.elo_after || row.elo_2v2 || 100)),
-    eloBefore: row.elo_before == null ? null : Number(row.elo_before), eloAfter: row.elo_after == null ? null : Number(row.elo_after),
-    eloDelta: row.elo_delta == null ? null : Number(row.elo_delta), result: row.result || null,
-    stats: buildPlayerMatchStats(row), isMatchMvp: !!row.is_match_mvp
-  }));
+  const players = playersRes.rows.map((row) => {
+    const stats = flatStats(row);
+    return {
+      userId: row.user_id, steamId: row.steam_id, nickname: row.persona_name, avatarUrl: row.avatar_full_url || null,
+      team: row.team, slotIndex: Number(row.slot_index || 0), ...stats,
+      eloBefore: row.elo_before == null ? null : Number(row.elo_before), eloAfter: row.elo_after == null ? null : Number(row.elo_after),
+      eloChange: row.elo_delta == null ? null : Number(row.elo_delta), eloDelta: row.elo_delta == null ? null : Number(row.elo_delta),
+      result: row.result || null, isMatchMvp: !!row.is_match_mvp, hasDetailedStats: !!row.has_detailed_stats,
+      rank: getRankForElo(Number(row.elo_after || row.elo_2v2 || 100))
+    };
+  });
   return {
-    matchId: match.public_match_id, publicMatchId: match.public_match_id, mode: match.mode, status: match.status,
-    map: match.map_name || null, mapName: match.map_name || null, durationSeconds: match.duration_seconds == null ? null : Number(match.duration_seconds),
-    startedAt: match.started_at || null, finishedAt: match.finished_at || null, createdAt: match.created_at || null,
-    server: { id: match.server_id || null, name: match.server_name || null, region: match.server_region || null },
-    score: { teamA: Number(match.team_a_score || 0), teamB: Number(match.team_b_score || 0), winnerTeam: match.winner_team || null },
-    teams: { A: players.filter((p)=>p.team==='A'), B: players.filter((p)=>p.team==='B') }, players,
-    rounds: roundsRes.rows.map((r)=>({ roundNumber:Number(r.round_number), winnerTeam:r.winner_team, reason:r.reason, teamAScore:Number(r.team_a_score||0), teamBScore:Number(r.team_b_score||0), durationSeconds:r.duration_seconds==null?null:Number(r.duration_seconds) }))
+    id: match.public_match_id, matchId: match.public_match_id, publicMatchId: match.public_match_id, mode: match.mode,
+    status: match.status === 'finished' ? 'completed' : match.status, rawStatus: match.status,
+    map: match.map_name || null, mapName: match.map_name || null, winnerTeam: match.winner_team || null,
+    teamAScore: Number(match.team_a_score || 0), teamBScore: Number(match.team_b_score || 0),
+    startedAt: toIso(match.started_at), completedAt: toIso(match.finished_at), finishedAt: toIso(match.finished_at), createdAt: toIso(match.created_at),
+    durationSeconds: match.duration_seconds == null ? null : Number(match.duration_seconds),
+    server: { name: match.server_name || null, region: match.server_region || null },
+    players,
+    teams: { A: players.filter((p)=>p.team==='A'), B: players.filter((p)=>p.team==='B') },
+    rounds: roundsRes.rows.map((r)=>({ roundNumber:Number(r.round_number), winnerTeam:r.winner_team, reason:r.reason, reasonLabel:reasonLabel(r.reason), teamAScore:Number(r.team_a_score||0), teamBScore:Number(r.team_b_score||0), durationSeconds:r.duration_seconds==null?null:Number(r.duration_seconds) }))
   };
 }
 
 async function getPlayerMatchHistoryBySteamId(steamId, page = 1, limit = 20) {
-  const safePage = Math.max(1, Number(page) || 1); const safeLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
+  const safePage = Math.max(1, Number.parseInt(page, 10) || 1); const safeLimit = Math.max(1, Math.min(Number.parseInt(limit, 10) || 20, 50));
+  if (!validSteamId(steamId)) return { items: [], page: safePage, limit: safeLimit, total: 0, totalPages: 0 };
   const userRes = await query(`SELECT id FROM users WHERE steam_id=$1 LIMIT 1`, [String(steamId)]);
   const user = userRes.rows[0];
-  if (!user) return { page: safePage, limit: safeLimit, total: 0, items: [] };
-  const countRes = await query(`SELECT COUNT(*)::int AS total FROM match_players mp JOIN matches m ON m.id=mp.match_id WHERE mp.user_id=$1 AND m.status='finished'`, [user.id]);
+  if (!user) return { items: [], page: safePage, limit: safeLimit, total: 0, totalPages: 0 };
+  const countRes = await query(`SELECT COUNT(*)::int AS total FROM match_players mp JOIN matches m ON m.id=mp.match_id WHERE mp.user_id=$1`, [user.id]);
+  const total = Number(countRes.rows[0]?.total || 0);
   const rows = await query(
-    `SELECT m.public_match_id, m.map_name, m.team_a_score, m.team_b_score, m.winner_team, m.finished_at, m.duration_seconds,
-            mp.team, mp.result, mp.elo_before, mp.elo_after, mp.elo_delta, mp.kills, mp.deaths, mp.assists, mp.damage, mp.is_match_mvp
+    `SELECT m.public_match_id, m.status, m.map_name, m.team_a_score, m.team_b_score, m.winner_team, COALESCE(m.finished_at,m.started_at,m.created_at) AS played_at,
+            mp.team, mp.result, mp.elo_delta, mp.kills, mp.deaths, mp.assists, mp.is_match_mvp, mp.has_detailed_stats
      FROM match_players mp JOIN matches m ON m.id=mp.match_id
-     WHERE mp.user_id=$1 AND m.status='finished' ORDER BY m.finished_at DESC NULLS LAST, m.created_at DESC LIMIT $2 OFFSET $3`, [user.id, safeLimit, (safePage-1)*safeLimit]
+     WHERE mp.user_id=$1 ORDER BY COALESCE(m.finished_at,m.started_at,m.created_at) DESC LIMIT $2 OFFSET $3`, [user.id, safeLimit, (safePage-1)*safeLimit]
   );
-  return { page: safePage, limit: safeLimit, total: Number(countRes.rows[0]?.total || 0), items: rows.rows.map((r)=>({ matchId:r.public_match_id, mapName:r.map_name, score:{teamA:Number(r.team_a_score||0), teamB:Number(r.team_b_score||0), winnerTeam:r.winner_team}, finishedAt:r.finished_at, durationSeconds:r.duration_seconds==null?null:Number(r.duration_seconds), team:r.team, result:r.result, eloBefore:r.elo_before, eloAfter:r.elo_after, eloDelta:r.elo_delta, stats:{kills:Number(r.kills||0),deaths:Number(r.deaths||0),assists:Number(r.assists||0),damage:Number(r.damage||0)}, isMatchMvp:!!r.is_match_mvp })) };
+  return { items: rows.rows.map((r)=>{ const result=normalizeResult(r.status,r.winner_team,r.team); const teamScore=r.team==='A'?Number(r.team_a_score||0):Number(r.team_b_score||0); const opponentScore=r.team==='A'?Number(r.team_b_score||0):Number(r.team_a_score||0); return { id:r.public_match_id, matchId:r.public_match_id, status:r.status==='finished'?'completed':r.status, map:r.map_name, mapName:r.map_name, playedAt:toIso(r.played_at), team:r.team, winnerTeam:r.winner_team, result, teamScore, opponentScore, kills:r.has_detailed_stats?Number(r.kills||0):null, deaths:r.has_detailed_stats?Number(r.deaths||0):null, assists:r.has_detailed_stats?Number(r.assists||0):null, eloChange:r.elo_delta==null?null:Number(r.elo_delta), isMatchMvp:!!r.is_match_mvp, hasDetailedStats:!!r.has_detailed_stats }; }), page:safePage, limit:safeLimit, total, totalPages: Math.ceil(total / safeLimit) };
 }
 
 async function getPlayerAggregatedStatsBySteamId(steamId) {
-  const userRes = await query(`SELECT id, COALESCE(pp.elo_2v2,100) AS elo FROM users u LEFT JOIN player_profiles pp ON pp.user_id=u.id WHERE u.steam_id=$1 LIMIT 1`, [String(steamId)]);
-  const user = userRes.rows[0];
-  const zero = { steamId:String(steamId), matches:0, wins:0, losses:0, winrate:0, kills:0, deaths:0, assists:0, kd:0, averageDamagePerMatch:0, averageDamagePerRound:0, headshotRate:0, matchMvps:0, currentStreak:{type:null,count:0}, bestWinStreak:0, maps:{}, currentElo:user?Number(user.elo):100 };
-  if (!user) return zero;
+  const zero = { matches:0, wins:0, losses:0, draws:0, winrate:0, kills:0, deaths:0, assists:0, kd:0, headshots:0, headshotRate:0, damage:0, averageDamagePerMatch:0, averageDamagePerRound:0, matchMvpCount:0, currentStreak:{type:'none',count:0}, bestWinStreak:0, maps:[] };
+  if (!validSteamId(steamId)) return zero;
+  const userRes = await query(`SELECT id FROM users WHERE steam_id=$1 LIMIT 1`, [String(steamId)]);
+  const user = userRes.rows[0]; if (!user) return zero;
   const rows = await query(
-    `SELECT m.id, m.map_name, mp.result, mp.kills, mp.deaths, mp.assists, mp.headshots, mp.damage, mp.is_match_mvp, COALESCE(COUNT(mr.id),0)::int AS rounds
+    `SELECT m.id, m.map_name, m.winner_team, m.team_a_score, m.team_b_score, COALESCE(m.finished_at,m.created_at) AS played_at,
+            mp.team, mp.kills, mp.deaths, mp.assists, mp.headshots, mp.damage, mp.is_match_mvp, mp.has_detailed_stats, COALESCE(COUNT(mr.id),0)::int AS rounds
      FROM match_players mp JOIN matches m ON m.id=mp.match_id LEFT JOIN match_rounds mr ON mr.match_id=m.id
-     WHERE mp.user_id=$1 AND m.status='finished' GROUP BY m.id, mp.id ORDER BY COALESCE(m.finished_at,m.created_at) ASC`, [user.id]
+     WHERE mp.user_id=$1 AND m.status='finished' GROUP BY m.id, mp.id ORDER BY COALESCE(m.finished_at,m.created_at) DESC`, [user.id]
   );
   if (!rows.rows.length) return zero;
-  const stats = { ...zero, matches: rows.rows.length };
-  let totalRounds = 0; const results=[];
-  for (const r of rows.rows) {
-    const win = r.result === 'win'; results.push(r.result); stats.wins += win ? 1 : 0; stats.losses += r.result === 'loss' ? 1 : 0;
-    stats.kills += Number(r.kills||0); stats.deaths += Number(r.deaths||0); stats.assists += Number(r.assists||0);
-    stats.headshotRate += Number(r.headshots||0); stats.averageDamagePerMatch += Number(r.damage||0); stats.matchMvps += r.is_match_mvp ? 1 : 0; totalRounds += Number(r.rounds||0);
-    const key = r.map_name || 'unknown'; stats.maps[key] ||= { matches:0, wins:0, losses:0 }; stats.maps[key].matches += 1; stats.maps[key].wins += win ? 1 : 0; stats.maps[key].losses += r.result === 'loss' ? 1 : 0;
-  }
-  const headshots = stats.headshotRate; stats.winrate = stats.matches ? Math.round((stats.wins/stats.matches)*10000)/100 : 0; stats.kd = stats.deaths ? Math.round((stats.kills/stats.deaths)*100)/100 : stats.kills; stats.averageDamagePerRound = totalRounds ? Math.round((stats.averageDamagePerMatch/totalRounds)*100)/100 : 0; stats.averageDamagePerMatch = Math.round((stats.averageDamagePerMatch/stats.matches)*100)/100; stats.headshotRate = stats.kills ? Math.round((headshots/stats.kills)*10000)/100 : 0;
-  const streaks = buildStreaks(results); stats.bestWinStreak = streaks.bestWinStreak; let cur=0; const last=results[results.length-1]; for(let i=results.length-1;i>=0&&results[i]===last;i--) cur++; stats.currentStreak={type:last,count:cur};
-  for (const m of Object.values(stats.maps)) m.winrate = m.matches ? Math.round((m.wins/m.matches)*10000)/100 : 0;
-  return stats;
+  const out = { ...zero, matches: rows.rows.length, maps: [] }; const maps = new Map(); const results=[]; let telemetryMatches=0,totalRounds=0;
+  for (const r of rows.rows) { const result=normalizeResult('finished',r.winner_team,r.team); results.push(result); out.wins += result==='win'?1:0; out.losses += result==='loss'?1:0; out.draws += result==='draw'?1:0; const key=r.map_name||'unknown'; if(!maps.has(key)) maps.set(key,{map:key,matches:0,wins:0,losses:0,kills:0,deaths:0,damage:0,telemetryMatches:0}); const m=maps.get(key); m.matches++; m.wins += result==='win'?1:0; m.losses += result==='loss'?1:0; if(r.has_detailed_stats){ telemetryMatches++; const kills=Number(r.kills||0), deaths=Number(r.deaths||0), assists=Number(r.assists||0), hs=Number(r.headshots||0), dmg=Number(r.damage||0); out.kills+=kills; out.deaths+=deaths; out.assists+=assists; out.headshots+=hs; out.damage+=dmg; out.matchMvpCount += r.is_match_mvp?1:0; totalRounds += Number(r.rounds||0); m.kills+=kills; m.deaths+=deaths; m.damage+=dmg; m.telemetryMatches++; } }
+  out.winrate=round2(out.matches?out.wins/out.matches*100:0); out.kd=round2(out.deaths?out.kills/out.deaths:out.kills); out.headshotRate=round2(out.kills?out.headshots/out.kills*100:0); out.averageDamagePerMatch=round2(telemetryMatches?out.damage/telemetryMatches:0); out.averageDamagePerRound=round2(totalRounds?out.damage/totalRounds:0);
+  const first=results[0]; if(first){ let c=0; for(const r of results){ if(r===first)c++; else break; } out.currentStreak={type:first,count:c}; }
+  let run=0; for(const r of [...results].reverse()){ if(r==='win'){run++; out.bestWinStreak=Math.max(out.bestWinStreak,run);} else run=0; }
+  out.maps=[...maps.values()].map((m)=>({ map:m.map, matches:m.matches, wins:m.wins, losses:m.losses, winrate:round2(m.matches?m.wins/m.matches*100:0), kills:m.kills, deaths:m.deaths, kd:round2(m.deaths?m.kills/m.deaths:m.kills), averageDamage:round2(m.telemetryMatches?m.damage/m.telemetryMatches:0) })).sort((a,b)=>b.matches-a.matches||a.map.localeCompare(b.map));
+  return out;
 }
 
 module.exports = {

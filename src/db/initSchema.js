@@ -266,6 +266,7 @@ async function repairMatchStatsTables(client) {
     ALTER TABLE match_players ADD COLUMN IF NOT EXISTS clutches INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE match_players ADD COLUMN IF NOT EXISTS performance_score NUMERIC NOT NULL DEFAULT 0;
     ALTER TABLE match_players ADD COLUMN IF NOT EXISTS is_match_mvp BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE match_players ADD COLUMN IF NOT EXISTS has_detailed_stats BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS match_rounds (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       match_id UUID NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
@@ -280,6 +281,9 @@ async function repairMatchStatsTables(client) {
       CONSTRAINT match_rounds_winner_team_check CHECK (winner_team IN ('A','B'))
     );
     CREATE INDEX IF NOT EXISTS idx_match_rounds_match_round ON match_rounds(match_id, round_number);
+    CREATE INDEX IF NOT EXISTS idx_matches_finished_at ON matches(status, finished_at DESC, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_match_players_match_team_slot ON match_players(match_id, team, slot_index);
+    CREATE INDEX IF NOT EXISTS idx_match_players_match_mvp ON match_players(match_id, is_match_mvp);
   `);
 }
 

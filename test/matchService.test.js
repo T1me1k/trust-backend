@@ -17,3 +17,17 @@ test('MVP tie breaker prefers damage, kills, fewer deaths, then steam ID', () =>
     { steamId: 'a', kills: 1, deaths: 1, assists: 0, headshots: 0, damage: 100, mvps: 0, firstKills: 0, clutches: 0 }
   ]).steamId, 'a');
 });
+
+test('MVP tie breaker prefers higher damage', () => {
+  assert.equal(pickMatchMvp([
+    { steamId: '1', kills: 1, deaths: 1, assists: 0, headshots: 0, damage: 200, mvps: 0, firstKills: 0, clutches: 0 },
+    { steamId: '2', kills: 1, deaths: 1, assists: 0, headshots: 0, damage: 100, mvps: 0, firstKills: 0, clutches: 0 }
+  ]).steamId, '1');
+});
+
+test('MVP tie breaker prefers more kills then fewer deaths', () => {
+  assert.equal(pickMatchMvp([
+    { steamId: '1', kills: 2, deaths: 3, assists: 0, headshots: 0, damage: 100, mvps: 0, firstKills: 0, clutches: 0 },
+    { steamId: '2', kills: 1, deaths: 1, assists: 0, headshots: 0, damage: 100, mvps: 0, firstKills: 0, clutches: 0 }
+  ]).steamId, '1');
+});
